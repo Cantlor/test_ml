@@ -1,0 +1,160 @@
+# =========================
+# module_net_train: TRAIN CONFIG (v1)
+# =========================
+
+paths:
+  # Запускаем скрипты из module_net_train/, поэтому ".." — это корень проекта
+  prep_data_root: ../prep_data
+  prep_work_root: ../output_data/module_prep_data_work
+  aoi_manifest: ../output_data/module_prep_data_work/aoi_rasters_manifest.json
+  runs_root: ../output_data/module_net_train/runs
+
+dataset:
+  # Пока считаем всё как "один большой датасет" из prep_data/*
+  mode: single  # single | multi (multi оставлено на будущее)
+
+  splits:
+    train: train
+    val: validation
+    test: test
+
+  inputs:
+    num_bands: 8
+    nodata_value: 65536
+
+  targets:
+    extent:
+      ignore_value: 255     # extent_ig: 0/1/255
+    boundary_bwbl:
+      skeleton_value: 1     # bwbl: 0 фон, 1 skeleton, 2 buffer(ignore)
+      ignore_value: 2
+
+normalization:
+  # Для разных сезонов обычно лучше robust-скейлинг по percentiles
+  type: robust_percentile      # robust_percentile | mean_std
+  p_low: 2
+  p_high: 98
+  per_band: true
+  stats_split: train
+  ignore_nodata: true
+
+augmentations:
+  enabled: true
+  # На старте — только геометрия (без изменения спектра)
+  hflip: true
+  vflip: true
+  rotate90: true
+  # Если позже понадобится:
+  # brightness_contrast: 0.0
+
+sampling:
+  # Из файлов img_* (обычно 512) берём random crop под GPU
+  crop_size: 256
+  # Если захочешь: можно добавить oversample_boundary / oversample_positive позже
+  # strategy: uniform
+
+model:
+  name: unet_multitask
+  in_channels: 8
+  out_heads:
+    extent: 1
+    boundary: 1
+  # Под 4GB VRAM безопаснее начать с 16
+  base_channels: 16
+  depth: 4
+  norm: batchnorm
+  dropout: 0.0
+
+loss:
+  weights:
+    extent: 1.0
+    boundary: 1.0
+
+  extent:
+    bce_weight: 1.0
+    dice_weight: 1.0
+    ignore_value: 255
+
+  boundary_bwbl:
+    # BCE по skeleton (1), buffer (2) игнорируется
+    ignore_value: 2
+
+metrics:
+  extent:
+    threshold: 0.50
+    compute_iou: true
+    compute_f1: true
+
+  boundary:
+    # удобно сразу видеть две точки: "строгую" и "как в постпроцессе"
+    thresholds: [0.50, 0.35]
+    dilation_px: 2
+    compute_f1: true
+
+train:
+  seed: 123
+  deterministic: false
+
+  epochs: 20
+  # Можно переключить на iters, если хочешь строгий контроль:
+  # max_steps: null
+
+  optimizer:
+    name: adamw
+    lr: 0.001
+    weight_decay: 0.0001
+
+  scheduler:
+    name: cosine
+    warmup_epochs: 2
+    min_lr: 0.00001
+
+  grad_clip_norm: 1.0
+
+  batch:
+    autotune: true
+    # Если autotune выключишь — эти значения будут использованы напрямую:
+    batch_size: 4
+    grad_accum_steps: 1
+
+  log_every_n_steps: 20
+  val_every_epochs: 1
+
+  checkpoint:
+    save_last: true
+    save_best: true
+    monitor: val/extent_iou
+    mode: max
+
+inference:
+  # Генерация extent_prob.tif и boundary_prob.tif по AOI-растру
+  enabled: true
+
+  aoi:
+    # Сейчас работаем с first_raster (ключ должен совпадать с manifest'ом из module_prep_data)
+    dataset_key: first_raster
+    aoi_manifest: ../output_data/module_prep_data_work/aoi_rasters_manifest.json
+
+  tiling:
+    # Безопасные размеры под 4GB, без швов за счёт overlap
+    window_size: 512
+    stride: 384
+    # Если нужно — можно сделать меньше (window 384 / stride 256)
+    batch_size: auto
+
+    blend: mean   # mean | gaussian (если сделаем позже)
+
+  outputs:
+    extent_prob_name: extent_prob.tif
+    boundary_prob_name: boundary_prob.tif
+    dtype: float32
+    compress: deflate
+    tiled: true
+    bigtiff: if_needed
+
+multi_dataset:
+  # Заготовка на будущее (сейчас dataset.mode=single)
+  datasets: [first_raster, second_raster]
+  sampling_weights:
+    first_raster: 1.0
+    second_raster: 1.0

@@ -1,0 +1,12 @@
+# Core
+numpy
+pyyaml
+rich
+scipy
+rasterio
+
+# DL
+torch
+
+# Optional logging/experiments
+tensorboard
