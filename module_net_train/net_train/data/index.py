@@ -14,6 +14,7 @@ class SampleRecord:
     dataset: str
     meta_path: Path
     img_path: Path
+    valid_path: Path               # NEW
     extent_path: Path
     boundary_bwbl_path: Path
     meta: Dict[str, Any]
@@ -29,6 +30,7 @@ class IndexResult:
 def _expected_paths(split_root: Path, patch_id: str) -> Dict[str, Path]:
     return {
         "img": split_root / "img" / f"img_{patch_id}.tif",
+        "valid": split_root / "valid" / f"valid_{patch_id}.tif",            # NEW
         "extent": split_root / "extent" / f"extent_{patch_id}.tif",
         "boundary_bwbl": split_root / "boundary_bwbl" / f"bwbl_{patch_id}.tif",
     }
@@ -66,6 +68,7 @@ def build_index_for_split(prep_data_root: Path, split_name: str) -> IndexResult:
                 dataset=dataset,
                 meta_path=meta_path,
                 img_path=paths["img"],
+                valid_path=paths["valid"],                  # NEW
                 extent_path=paths["extent"],
                 boundary_bwbl_path=paths["boundary_bwbl"],
                 meta=meta,

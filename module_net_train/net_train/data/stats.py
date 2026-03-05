@@ -25,29 +25,33 @@ class NormalizationStats:
         return asdict(self)
 
 
-
-def _sample_pixels(img: np.ndarray, max_pixels: int, rng: np.random.Generator) -> np.ndarray:
-    """img: (C,H,W) -> sampled (C,N)."""
+def _sample_pixels_with_valid(
+    img: np.ndarray,
+    valid_u8: np.ndarray,
+    max_pixels: int,
+    rng: np.random.Generator,
+    ignore_nodata: bool,
+) -> np.ndarray:
+    """
+    img: (C,H,W), valid_u8: (H,W) with {0,1}
+    returns sampled pixels as (C,N)
+    """
     c, h, w = img.shape
     flat = img.reshape(c, h * w)
-    n = flat.shape[1]
-    if n <= max_pixels:
-        return flat
-    idx = rng.choice(n, size=max_pixels, replace=False)
-    return flat[:, idx]
+    valid_flat = (valid_u8.reshape(h * w) > 0)
 
+    if ignore_nodata:
+        idx_all = np.flatnonzero(valid_flat)
+    else:
+        idx_all = np.arange(h * w, dtype=np.int64)
 
+    if idx_all.size == 0:
+        return np.empty((c, 0), dtype=img.dtype)
 
-def _filter_nodata(sample: np.ndarray, nodata_value: float | None, ignore_nodata: bool) -> np.ndarray:
-    if nodata_value is None or not ignore_nodata:
-        return sample
-
-    valid = np.ones(sample.shape[1], dtype=bool)
-    for c in range(sample.shape[0]):
-        valid &= sample[c] != nodata_value
-    if not valid.any():
-        return sample
-    return sample[:, valid]
+    if idx_all.size > max_pixels:
+        idx = rng.choice(idx_all, size=max_pixels, replace=False)
+        return flat[:, idx]
+    return flat[:, idx_all]
 
 
 
@@ -61,6 +65,7 @@ def compute_normalization_stats(
     p_high: float = 98.0,
     max_pixels_per_image: int = 25000,
     seed: int = 123,
+    image_bands: int = 8,
 ) -> NormalizationStats:
     rng = np.random.default_rng(seed)
 
@@ -71,13 +76,33 @@ def compute_normalization_stats(
     for rec in records:
         with rasterio.open(rec.img_path) as ds:
             img = ds.read().astype(np.float32)
-        sampled = _sample_pixels(img, max_pixels=max_pixels_per_image, rng=rng)
-        sampled = _filter_nodata(sampled, nodata_value=nodata_value, ignore_nodata=ignore_nodata)
-        if sampled.size > 0:
+
+        if img.shape[0] < int(image_bands):
+            raise RuntimeError(
+                f"{rec.img_path}: expected at least {int(image_bands)} bands for normalization stats, got {img.shape[0]}"
+            )
+        img = img[: int(image_bands)]
+
+        valid = np.ones((img.shape[1], img.shape[2]), dtype=np.uint8)
+        valid_path = getattr(rec, "valid_path", None)
+        if valid_path is not None:
+            with rasterio.open(valid_path) as ds:
+                valid = (ds.read(1) > 0).astype(np.uint8)
+        elif nodata_value is not None:
+            valid = (~np.all(img == float(nodata_value), axis=0)).astype(np.uint8)
+
+        sampled = _sample_pixels_with_valid(
+            img=img,
+            valid_u8=valid,
+            max_pixels=max_pixels_per_image,
+            rng=rng,
+            ignore_nodata=bool(ignore_nodata),
+        )
+        if sampled.shape[1] > 0:
             samples.append(sampled)
 
     if not samples:
-        raise RuntimeError("No valid pixels for normalization stats")
+        raise RuntimeError("No valid pixels for normalization stats (check valid masks / nodata policy)")
 
     stacked = np.concatenate(samples, axis=1)  # (C,N)
 
@@ -133,12 +158,15 @@ def normalize_image(
     img: np.ndarray,
     stats: NormalizationStats,
     nodata_value: float | None = None,
+    valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Normalize image (C,H,W), return float32."""
     x = img.astype(np.float32, copy=False)
-    nodata_mask = None
-    if nodata_value is not None:
-        nodata_mask = np.all(x == float(nodata_value), axis=0)
+    invalid_mask = None
+    if valid_mask is not None:
+        invalid_mask = (valid_mask <= 0)
+    elif nodata_value is not None:
+        invalid_mask = np.all(x == float(nodata_value), axis=0)
 
     if stats.mode == "robust_percentile":
         ql = np.asarray(stats.q_low, dtype=np.float32)
@@ -154,8 +182,8 @@ def normalize_image(
         denom = np.clip(qh - ql, 1e-6, None)
         x = (x - ql) / denom
         x = np.clip(x, 0.0, 1.0)
-        if nodata_mask is not None and nodata_mask.any():
-            x[:, nodata_mask] = 0.0
+        if invalid_mask is not None and invalid_mask.any():
+            x[:, invalid_mask] = 0.0
         return x
 
     if stats.mode == "mean_std":
@@ -168,8 +196,8 @@ def normalize_image(
             mu = mu.reshape(1, 1, 1)
             sd = sd.reshape(1, 1, 1)
         x = (x - mu) / np.clip(sd, 1e-6, None)
-        if nodata_mask is not None and nodata_mask.any():
-            x[:, nodata_mask] = 0.0
+        if invalid_mask is not None and invalid_mask.any():
+            x[:, invalid_mask] = 0.0
         return x
 
     raise ValueError(f"Unknown normalization mode: {stats.mode}")

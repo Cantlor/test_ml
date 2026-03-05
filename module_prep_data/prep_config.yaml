@@ -1,0 +1,182 @@
+version: 1
+project_name: uzcosmos_my_project
+
+paths:
+  initial_data_dir: ../initial_data
+  prep_data_dir: ../prep_data
+  output_data_dir: ../output_data
+  work_dir: ../output_data/module_prep_data_work
+
+datasets:
+  - name: first_raster
+    root: ../initial_data/first_raster
+    raster:
+      glob: ["*.tif", "*.tiff"]
+      require_single_match: true
+    vector:
+      glob: ["*.shp"]
+      require_single_match: true
+      layer: null
+      id_field: null
+
+standards:
+  crs_mode: raster_native
+  resolution_mode: raster_native
+  metric_crs_mode: auto_utm
+
+expectations:
+  band_count: auto_from_first
+  dtype: auto_from_first
+  nodata: auto_from_first   # проверяем, что это = 65536 (см. nodata_policy)
+
+# ✅ НОВОЕ: фиксируем NoData policy как в spec
+nodata_policy:
+  nodata_value: 65536
+  rule: control-band        # control-band | all-bands
+  control_band_1based: 1
+  # Важно: valid_mask строим ДО nodata_to_value
+  compute_valid_before_nodata_remap: true
+
+qa:
+  raster:
+    require_crs: true
+    require_geotransform: true
+    allow_rotated_geotransform: false
+    min_valid_ratio_global: 0.70
+
+  vector:
+    # ⚠️ GT не трогаем. Только проверяем/репортим.
+    fix_invalid_geometries: none       # было make_valid
+    drop_empty: true
+    explode_multipolygons: true
+    keep_holes: true
+    holes_policy: background
+    min_area_m2: 1000
+    clip_to_raster_bounds: true
+
+raster_preprocess:
+  convert_dtype: float32
+  nodata_to_value: 0
+  compute_valid_ratio_before_nodata_zeroing: true
+
+  compute_band_stats:
+    enabled: true
+    method: sample
+    sample_max_pixels: 5000000
+    clip_percentiles: [1, 99]
+    # лучше хранить в output_data/module_prep_data_work чтобы не пересекалось с train-раном
+    save_path: ../output_data/module_prep_data_work/band_stats.npz
+
+patching:
+  patch_size_px: 512
+  train_crop_px: 256
+  pad_px: 16
+  target_patches_per_dataset: 800
+
+  sampling:
+    mode: mixed
+    weights:
+      center: 0.6
+      boundary: 0.4
+    samples_per_feature: 1
+
+    negatives:
+      enabled: true
+      ratio: 0.15
+      min_distance_to_fields_m: 15
+
+    # ✅ НОВОЕ: near-NoData квота
+    near_nodata:
+      enabled: true
+      ratio_target: 0.20          # 10–25% по spec
+      nodata_frac_min: 0.05       # патч считается near-NoData, если ≥5% пикселей NoData
+
+  filters:
+    # ⚠️ было 0.90 — near-NoData патчи вылетят; оставляем разумно низкий порог
+    min_valid_ratio: 0.50
+    min_mask_ratio: 0.03
+    max_mask_ratio: 0.90
+    neg_max_mask_ratio: 0.01
+
+labels:
+  build_extent: true
+  build_boundary_raw: true
+  build_boundary_bwbl: true
+
+  # ✅ НОВОЕ: отдельный extent_ig как в spec
+  build_extent_ig: true
+
+  boundary:
+    include_holes: true
+
+  bwbl:
+    background_value: 0
+    skeleton_value: 1
+    buffer_value: 2
+    buffer_px: 3
+
+  ignore_zone:
+    enabled: true
+    ignore_value: 255
+    # ⚠️ было 4 — по spec нужно 7 (≈20 м)
+    ignore_radius_px: 7
+    apply_to_extent: true
+
+  # ✅ НОВОЕ: NoData ignore policy на таргеты
+  nodata_ignore_policy:
+    enabled: true
+    # где valid=0:
+    extent_ig_value: 255
+    bwbl_ignore_value: 2
+
+split:
+  ratios:
+    train: 0.80
+    validation: 0.10
+    test: 0.10
+  unit: by_field
+  seed: 123
+  spatial_blocking:
+    enabled: false
+
+export:
+  structure:
+    train_dir: ../prep_data/train
+    validation_dir: ../prep_data/validation
+    test_dir: ../prep_data/test
+  folders:
+    img: img
+    extent: extent
+    extent_ig: extent_ig        # ✅ добавили
+    boundary_raw: boundary_raw
+    boundary_bwbl: boundary_bwbl
+    valid: valid                # ✅ добавили
+    meta: meta
+
+reporting:
+  save_data_check_json: true
+  data_check_json_path: ../output_data/data_check.json
+  save_summary_csv: true
+  summary_csv_path: ../output_data/patches_summary.csv
+  save_previews: true
+  previews_dir: ../output_data/previews
+  preview_count: 30
+
+performance:
+  num_workers: 6
+  gdal_cache_mb: 1024
+  progress: true
+
+logging:
+  level: INFO
+  log_file: ../output_data/module_prep_data.log
+
+aoi_clip:
+  enabled: true
+  mode: bbox
+  buffer_m: 0
+  mask_outside: false
+  out_dir: ../output_data/module_prep_data_work/aoi_rasters
+  compress: DEFLATE
+  tiled: true
+  bigtiff: if_needed

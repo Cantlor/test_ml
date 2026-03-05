@@ -15,7 +15,6 @@ from net_train.infer.tiling import TileWindow, blend_weights, generate_windows
 from net_train.utils.io import read_json
 
 
-
 def _resolve_from_manifest_obj(obj: object, dataset_key: str) -> Path | None:
     # Preferred contract: {"dataset_key": "/abs/path/to/aoi.tif"}
     if isinstance(obj, dict) and dataset_key in obj and isinstance(obj[dataset_key], str):
@@ -55,11 +54,32 @@ def resolve_aoi_path(manifest_path: Path, dataset_key: str) -> Path:
     )
 
 
-
 def _batch_iter(seq: List[TileWindow], batch_size: int):
     for i in range(0, len(seq), batch_size):
         yield seq[i:i + batch_size]
 
+
+def _valid_mask_from_chip(
+    chip: np.ndarray,
+    nodata_value: float | None,
+    nodata_rule: str,
+    control_band_1based: int,
+) -> np.ndarray:
+    """
+    chip: (C,H,W), returns uint8 mask (H,W) with values {0,1}
+    """
+    h, w = chip.shape[1], chip.shape[2]
+    if nodata_value is None:
+        return np.ones((h, w), dtype=np.uint8)
+
+    rule = str(nodata_rule or "control-band").strip().lower()
+    if rule == "all-bands":
+        is_nodata = np.all(chip == float(nodata_value), axis=0)
+    else:
+        b = int(control_band_1based) - 1
+        b = max(0, min(b, chip.shape[0] - 1))
+        is_nodata = (chip[b] == float(nodata_value))
+    return (~is_nodata).astype(np.uint8)
 
 
 def _prepare_chip(
@@ -67,17 +87,40 @@ def _prepare_chip(
     tile: TileWindow,
     model_window_size: int,
     norm_stats: NormalizationStats,
-) -> tuple[np.ndarray, tuple[int, int]]:
-    arr = ds.read(window=Window(tile.x, tile.y, tile.w, tile.h)).astype(np.float32)
-    c, h, w = arr.shape
+    num_bands: int,
+    add_valid_channel: bool,
+    nodata_value: float | None,
+    nodata_rule: str,
+    control_band_1based: int,
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    if ds.count < int(num_bands):
+        raise RuntimeError(f"{ds.name}: expected at least {int(num_bands)} bands, got {ds.count}")
+
+    indexes = list(range(1, int(num_bands) + 1))
+    arr = ds.read(indexes=indexes, window=Window(tile.x, tile.y, tile.w, tile.h)).astype(np.float32)
+    _, h, w = arr.shape
+
+    valid = _valid_mask_from_chip(
+        arr,
+        nodata_value=nodata_value,
+        nodata_rule=nodata_rule,
+        control_band_1based=control_band_1based,
+    )
 
     if h != model_window_size or w != model_window_size:
-        pad = np.zeros((c, model_window_size, model_window_size), dtype=np.float32)
+        pad = np.zeros((arr.shape[0], model_window_size, model_window_size), dtype=np.float32)
         pad[:, :h, :w] = arr
         arr = pad
 
-    arr = normalize_image(arr, norm_stats, nodata_value=ds.nodata)
-    return arr, (h, w)
+        valid_pad = np.zeros((model_window_size, model_window_size), dtype=np.uint8)
+        valid_pad[:h, :w] = valid
+        valid = valid_pad
+
+    arr = normalize_image(arr, norm_stats, nodata_value=nodata_value, valid_mask=valid)
+    if add_valid_channel:
+        arr = np.concatenate([arr, valid[None, :, :].astype(np.float32)], axis=0)
+
+    return arr, valid, (h, w)
 
 
 @torch.no_grad()
@@ -96,6 +139,11 @@ def predict_aoi_raster(
     compress: str = "DEFLATE",
     tiled: bool = True,
     bigtiff: str = "if_needed",
+    num_bands: int = 8,
+    add_valid_channel: bool = True,
+    nodata_value: float | None = 65536.0,
+    nodata_rule: str = "control-band",
+    control_band_1based: int = 1,
 ) -> Dict[str, object]:
     model.eval()
 
@@ -113,10 +161,22 @@ def predict_aoi_raster(
 
         for group in _batch_iter(tiles, max(1, int(batch_size))):
             chips = []
+            valid_masks = []
             valid_hw = []
             for tile in group:
-                chip, hw = _prepare_chip(ds, tile, model_window_size=window_size, norm_stats=norm_stats)
+                chip, valid_mask, hw = _prepare_chip(
+                    ds=ds,
+                    tile=tile,
+                    model_window_size=window_size,
+                    norm_stats=norm_stats,
+                    num_bands=num_bands,
+                    add_valid_channel=add_valid_channel,
+                    nodata_value=nodata_value,
+                    nodata_rule=nodata_rule,
+                    control_band_1based=control_band_1based,
+                )
                 chips.append(chip)
+                valid_masks.append(valid_mask)
                 valid_hw.append(hw)
 
             x = torch.from_numpy(np.stack(chips, axis=0)).to(device=device, dtype=torch.float32)
@@ -149,6 +209,12 @@ def predict_aoi_raster(
                 h, w = valid_hw[i]
                 e = extent_prob[i, :h, :w]
                 b = boundary_prob[i, :h, :w]
+                valid = valid_masks[i][:h, :w]
+
+                # NoData suppression guard-rail
+                e[valid == 0] = 0.0
+                b[valid == 0] = 0.0
+
                 ww = blend_weights(h=h, w=w, mode=blend)
 
                 y0, y1 = tile.y, tile.y + h

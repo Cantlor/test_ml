@@ -1,0 +1,10 @@
+rich
+pytest
+numpy
+pyyaml
+rasterio
+opencv-python-headless
+scikit-image
+geopandas
+shapely
+pyproj

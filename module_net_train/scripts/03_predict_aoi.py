@@ -46,6 +46,28 @@ def main() -> int:
     plan = build_runtime_plan(train_cfg, hw_cfg)
     apply_torch_runtime_flags(plan)
 
+    infer_cfg = train_cfg.raw.get("inference", {}) or {}
+    aoi_cfg = infer_cfg.get("aoi", {}) or {}
+    tiling_cfg = infer_cfg.get("tiling", {}) or {}
+    out_cfg = infer_cfg.get("outputs", {}) or {}
+    ds_cfg = train_cfg.raw.get("dataset", {}) or {}
+    inputs_cfg = (ds_cfg.get("inputs", {}) or {})
+    num_bands = int(inputs_cfg.get("num_bands", 8))
+    add_valid_channel = bool(inputs_cfg.get("add_valid_channel", True))
+    nodata_value = inputs_cfg.get("nodata_value", 65536)
+    nodata_value = None if nodata_value is None else float(nodata_value)
+    nodata_rule = str(inputs_cfg.get("nodata_rule", "control-band"))
+    control_band_1based = int(inputs_cfg.get("control_band_1based", 1))
+
+    expected_in_channels = int(num_bands + (1 if add_valid_channel else 0))
+    model_cfg = train_cfg.raw.setdefault("model", {})
+    if int(model_cfg.get("in_channels", expected_in_channels)) != expected_in_channels:
+        logger.warning(
+            "model.in_channels mismatch, overriding to dataset contract value: %s",
+            expected_in_channels,
+        )
+    model_cfg["in_channels"] = expected_in_channels
+
     model = build_model(train_cfg.raw.get("model", {}) or {})
     model = model.to(torch.device(plan.device))
 
@@ -57,11 +79,6 @@ def main() -> int:
 
     ckpt = load_checkpoint(ckpt_path, map_location=plan.device)
     model.load_state_dict(ckpt["model_state"])
-
-    infer_cfg = train_cfg.raw.get("inference", {}) or {}
-    aoi_cfg = infer_cfg.get("aoi", {}) or {}
-    tiling_cfg = infer_cfg.get("tiling", {}) or {}
-    out_cfg = infer_cfg.get("outputs", {}) or {}
 
     dataset_key = args.dataset_key or str(aoi_cfg.get("dataset_key", "first_raster"))
 
@@ -89,6 +106,11 @@ def main() -> int:
         compress=str(out_cfg.get("compress", "DEFLATE")).upper(),
         tiled=bool(out_cfg.get("tiled", True)),
         bigtiff=str(out_cfg.get("bigtiff", "if_needed")),
+        num_bands=num_bands,
+        add_valid_channel=add_valid_channel,
+        nodata_value=nodata_value,
+        nodata_rule=nodata_rule,
+        control_band_1based=control_band_1based,
     )
 
     pred_info["checkpoint"] = str(ckpt_path)

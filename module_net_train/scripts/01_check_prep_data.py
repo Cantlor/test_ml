@@ -136,12 +136,14 @@ def main() -> int:
 
         extent_allowed = {0, 1, extent_ignore}
         bwbl_allowed = {0, 1, bwbl_ignore}
+        valid_allowed = {0, 1}
         mask_checks = []
         mask_candidates = records[: min(args.max_mask_checks, len(records))]
         for r in mask_candidates:
             e_chk = _check_mask_values(r.extent_path, extent_allowed)
             b_chk = _check_mask_values(r.boundary_bwbl_path, bwbl_allowed)
-            mask_checks.append({"extent": e_chk, "boundary_bwbl": b_chk})
+            v_chk = _check_mask_values(r.valid_path, valid_allowed)
+            mask_checks.append({"extent": e_chk, "boundary_bwbl": b_chk, "valid": v_chk})
             if not e_chk["ok"]:
                 split_errors.append(
                     f"{r.extent_path}: bad extent values {e_chk['bad_values']}"
@@ -149,6 +151,10 @@ def main() -> int:
             if not b_chk["ok"]:
                 split_errors.append(
                     f"{r.boundary_bwbl_path}: bad bwbl values {b_chk['bad_values']}"
+                )
+            if not v_chk["ok"]:
+                split_errors.append(
+                    f"{r.valid_path}: bad valid values {v_chk['bad_values']}"
                 )
 
         split_report = {

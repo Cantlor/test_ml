@@ -21,6 +21,12 @@ dataset:
   inputs:
     num_bands: 8
     nodata_value: 65536
+    # NEW: valid-mask как 9-й канал
+    add_valid_channel: true
+
+    # NEW: NoData policy для вычисления valid (если понадобится)
+    nodata_rule: control-band        # control-band | all-bands
+    control_band_1based: 1
 
   targets:
     extent:
@@ -55,7 +61,7 @@ sampling:
 
 model:
   name: unet_multitask
-  in_channels: 8
+  in_channels: 9
   out_heads:
     extent: 1
     boundary: 1
@@ -68,7 +74,7 @@ model:
 loss:
   weights:
     extent: 1.0
-    boundary: 1.0
+    boundary: 3.0
 
   extent:
     bce_weight: 1.0

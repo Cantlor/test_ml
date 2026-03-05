@@ -66,11 +66,25 @@ def main() -> int:
         raise RuntimeError(f"Checkpoint not found in {run_dir / 'checkpoints'}")
 
     ds_cfg = train_cfg.raw.get("dataset", {}) or {}
+    inputs_cfg = (ds_cfg.get("inputs", {}) or {})
     targets_cfg = (ds_cfg.get("targets", {}) or {})
     extent_ignore = int(((targets_cfg.get("extent", {}) or {}).get("ignore_value", 255)))
     boundary_ignore = int(((targets_cfg.get("boundary_bwbl", {}) or {}).get("ignore_value", 2)))
-    nodata = (ds_cfg.get("inputs", {}) or {}).get("nodata_value", None)
+    num_bands = int(inputs_cfg.get("num_bands", 8))
+    add_valid_channel = bool(inputs_cfg.get("add_valid_channel", True))
+    nodata_rule = str(inputs_cfg.get("nodata_rule", "control-band"))
+    control_band_1based = int(inputs_cfg.get("control_band_1based", 1))
+    nodata = inputs_cfg.get("nodata_value", 65536)
     nodata = None if nodata is None else float(nodata)
+
+    expected_in_channels = int(num_bands + (1 if add_valid_channel else 0))
+    model_cfg = train_cfg.raw.setdefault("model", {})
+    if int(model_cfg.get("in_channels", expected_in_channels)) != expected_in_channels:
+        logger.warning(
+            "model.in_channels mismatch, overriding to dataset contract value: %s",
+            expected_in_channels,
+        )
+    model_cfg["in_channels"] = expected_in_channels
 
     splits_cfg = (ds_cfg.get("splits", {}) or {})
     splits = {
@@ -90,10 +104,14 @@ def main() -> int:
         norm_stats=norm_stats,
         options=DatasetOptions(
             crop_size=0,
+            num_bands=num_bands,
             nodata_value=nodata,
             extent_ignore_value=extent_ignore,
             boundary_ignore_value=boundary_ignore,
             is_train=False,
+            add_valid_channel=add_valid_channel,
+            nodata_rule=nodata_rule,
+            control_band_1based=control_band_1based,
         ),
         augment_cfg=AugmentConfig(enabled=False),
         seed=123,
