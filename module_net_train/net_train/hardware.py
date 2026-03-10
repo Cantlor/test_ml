@@ -168,6 +168,18 @@ def _choose_num_workers(hw_cfg: HardwareConfig) -> int:
     return int(auto)
 
 
+def _can_use_multiprocessing_semlock() -> bool:
+    """
+    Some restricted environments (containers/sandboxes) disallow SemLock.
+    PyTorch DataLoader with num_workers>0 relies on it and fails at runtime.
+    """
+    try:
+        _ = multiprocessing.Semaphore(1)
+        return True
+    except Exception:
+        return False
+
+
 def apply_torch_runtime_flags(plan: RuntimePlan) -> None:
     _require_torch()
 
@@ -196,6 +208,13 @@ def build_runtime_plan(train_cfg: TrainConfig, hw_cfg: HardwareConfig) -> Runtim
         warnings.append("Training will run on CPU. This is expected only for debug runs.")
 
     dl_cfg = hw_cfg.raw.get("dataloader", {}) or {}
+    requested_workers = _choose_num_workers(hw_cfg)
+    num_workers = int(requested_workers)
+    if num_workers > 0 and not _can_use_multiprocessing_semlock():
+        warnings.append(
+            "Multiprocessing DataLoader is unavailable in this environment; falling back to num_workers=0."
+        )
+        num_workers = 0
 
     plan = RuntimePlan(
         device=device,
@@ -205,7 +224,7 @@ def build_runtime_plan(train_cfg: TrainConfig, hw_cfg: HardwareConfig) -> Runtim
         crop_size=crop_size,
         batch_size=batch_size,
         grad_accum_steps=grad_accum,
-        num_workers=_choose_num_workers(hw_cfg),
+        num_workers=num_workers,
         pin_memory=bool(dl_cfg.get("pin_memory", True)) and device == "cuda",
         persistent_workers=bool(dl_cfg.get("persistent_workers", True)),
         prefetch_factor=int(dl_cfg.get("prefetch_factor", 2)),

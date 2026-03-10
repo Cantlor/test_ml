@@ -93,6 +93,7 @@ def main() -> int:
     bwbl_buffer_px = int(cfg.labels.bwbl.buffer_px)
 
     build_extent = bool(cfg.labels.build_extent)
+    build_extent_ig = bool(cfg.labels.build_extent_ig)
     build_boundary_raw = bool(cfg.labels.build_boundary_raw)
     build_boundary_bwbl = bool(cfg.labels.build_boundary_bwbl)
     boundary_include_holes = bool(cfg.labels.boundary_include_holes)
@@ -101,6 +102,10 @@ def main() -> int:
     ignore_value = int(cfg.labels.ignore_zone.ignore_value)
     ignore_apply_to_extent = bool(cfg.labels.ignore_zone.apply_to_extent)
     ignore_radius_px = int(cfg.labels.ignore_zone.ignore_radius_px) if ignore_enabled else 0
+
+    nodata_ignore_enabled = bool(cfg.labels.nodata_ignore_policy.enabled)
+    nodata_ignore_extent_value = int(cfg.labels.nodata_ignore_policy.extent_ig_value)
+    nodata_ignore_bwbl_value = int(cfg.labels.nodata_ignore_policy.bwbl_ignore_value)
 
     # seed/target
     seed = int(cfg.split.seed)
@@ -121,9 +126,18 @@ def main() -> int:
     console.print(f"target_patches_per_dataset: {target}")
     console.print(f"negatives_ratio: {neg_ratio} (enabled={neg_enabled})")
     console.print(
-        f"labels: extent={build_extent} boundary_raw={build_boundary_raw} "
+        f"labels: extent={build_extent} extent_ig={build_extent_ig} boundary_raw={build_boundary_raw} "
         f"boundary_bwbl={build_boundary_bwbl} include_holes={boundary_include_holes}"
     )
+    console.print(
+        f"nodata_ignore_policy: enabled={nodata_ignore_enabled} "
+        f"extent_ig_value={nodata_ignore_extent_value} bwbl_ignore_value={nodata_ignore_bwbl_value}"
+    )
+    if nodata_ignore_enabled and nodata_ignore_bwbl_value != bwbl_buffer_value:
+        console.print(
+            "[yellow]WARNING[/yellow] nodata_ignore_policy.bwbl_ignore_value "
+            f"({nodata_ignore_bwbl_value}) != labels.bwbl.buffer_value ({bwbl_buffer_value})."
+        )
     console.print(
         f"NoData policy (for later valid_mask stage): value={cfg.nodata_policy.nodata_value} "
         f"rule={cfg.nodata_policy.rule} control_band_1based={cfg.nodata_policy.control_band_1based}"
@@ -157,6 +171,7 @@ def main() -> int:
             bwbl_skeleton_value=bwbl_skeleton_value,
             bwbl_buffer_value=bwbl_buffer_value,
             build_extent=build_extent,
+            build_extent_ig=build_extent_ig,
             build_boundary_raw=build_boundary_raw,
             build_boundary_bwbl=build_boundary_bwbl,
             boundary_include_holes=boundary_include_holes,
@@ -172,7 +187,9 @@ def main() -> int:
 
             # ✅ ВАЖНО: пишем valid-mask и применяем ignore policy по NoData
             write_valid_mask=True,
-            apply_nodata_ignore_policy=True,
+            apply_nodata_ignore_policy=nodata_ignore_enabled,
+            nodata_ignore_extent_value=nodata_ignore_extent_value,
+            nodata_ignore_bwbl_value=nodata_ignore_bwbl_value,
 
             seed=seed,
             target_patches=target,

@@ -32,6 +32,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Resolve config path before changing directory.
+if [[ "${CONFIG}" != /* ]]; then
+  CONFIG="$(realpath "${CONFIG}")"
+fi
+
 # colors
 BOLD="\033[1m"
 GRN="\033[32m"
@@ -67,9 +72,12 @@ echo "n_patches:        ${N_PATCHES}"
 echo "seed:             ${SEED}"
 
 # pick python
-PY=python3
-if ! command -v ${PY} >/dev/null 2>&1; then
-  die "python3 not found"
+PY="${PROJ_ROOT}/.venv/bin/python"
+if [[ ! -x "${PY}" ]]; then
+  PY=python3
+  if ! command -v ${PY} >/dev/null 2>&1; then
+    die "python3 not found"
+  fi
 fi
 
 # sanity: config exists
@@ -125,12 +133,8 @@ ok "Smoke checks passed"
 # ---------- Optional: pytest ----------
 if [[ "${RUN_PYTEST}" == "1" ]]; then
   step "pytest"
-  if command -v pytest >/dev/null 2>&1; then
-    pytest -q
-    ok "pytest passed"
-  else
-    warn "pytest not found; install it (pip install pytest) or add to requirements"
-  fi
+  ${PY} -m pytest -q
+  ok "pytest passed"
 fi
 
 step "DONE"

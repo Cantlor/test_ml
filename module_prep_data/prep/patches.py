@@ -46,6 +46,7 @@ class PatchConfig:
     bwbl_buffer_value: int
 
     build_extent: bool
+    build_extent_ig: bool
     build_boundary_raw: bool
     build_boundary_bwbl: bool
     boundary_include_holes: bool
@@ -65,6 +66,8 @@ class PatchConfig:
 
     # ✅ NEW: apply NoData ignore policy to targets
     apply_nodata_ignore_policy: bool = True    # valid=0 => extent_ig=255, bwbl=2
+    nodata_ignore_extent_value: int = 255
+    nodata_ignore_bwbl_value: int = 2
 
     seed: int = 123
     target_patches: int = 800
@@ -540,12 +543,12 @@ def make_patches_for_dataset(
             # ✅ Apply NoData ignore policy on targets
             if cfg.apply_nodata_ignore_policy:
                 invalid = (valid_u8 == 0)
-                # extent_ig ignore=255
+                # extent_ig ignore value from config
                 extent_ig = extent_ig.copy().astype(np.uint8)
-                extent_ig[invalid] = np.uint8(255)
-                # bwbl ignore=2 (buffer class)
+                extent_ig[invalid] = np.uint8(cfg.nodata_ignore_extent_value)
+                # boundary ignore value from config
                 bwbl = bwbl.copy().astype(np.uint8)
-                bwbl[invalid] = np.uint8(cfg.bwbl_buffer_value)  # buffer_value is 2 by our convention
+                bwbl[invalid] = np.uint8(cfg.nodata_ignore_bwbl_value)
 
             # write files
             base = patch_id
@@ -558,7 +561,7 @@ def make_patches_for_dataset(
             meta_path = meta_dir / f"meta_{base}.json"
 
             extent_out = extent.astype(np.uint8) if cfg.build_extent else np.zeros_like(extent, dtype=np.uint8)
-            extent_ig_out = extent_ig.astype(np.uint8) if cfg.build_extent else np.zeros_like(extent_ig, dtype=np.uint8)
+            extent_ig_out = extent_ig.astype(np.uint8) if cfg.build_extent_ig else np.zeros_like(extent_ig, dtype=np.uint8)
 
             braw_out = braw.astype(np.uint8) if cfg.build_boundary_raw else np.zeros_like(braw, dtype=np.uint8)
             bwbl_out = bwbl.astype(np.uint8) if cfg.build_boundary_bwbl else np.full_like(
@@ -606,7 +609,7 @@ def make_patches_for_dataset(
 
                 "labels_written": {
                     "extent": bool(cfg.build_extent),
-                    "extent_ig": True,
+                    "extent_ig": bool(cfg.build_extent_ig),
                     "boundary_raw": bool(cfg.build_boundary_raw),
                     "boundary_bwbl": bool(cfg.build_boundary_bwbl),
                     "valid": bool(cfg.write_valid_mask),
