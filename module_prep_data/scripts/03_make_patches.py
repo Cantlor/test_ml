@@ -203,6 +203,7 @@ def main() -> int:
             cfg=pcfg,
             cleaned_vector_gpkg=cleaned_vec_path,
             vector_layer=ds.vector_layer,  # важно для GPKG
+            vector_id_field=ds.vector_id_field,
         )
 
         console.print(f"[green]DONE[/green] manifest: {manifest}")

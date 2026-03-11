@@ -380,6 +380,7 @@ def make_patches_for_dataset(
     cfg: PatchConfig,
     cleaned_vector_gpkg: Optional[Path] = None,
     vector_layer: Optional[str] = None,
+    vector_id_field: Optional[str] = None,
 ) -> Path:
     """
     Writes patches into:
@@ -446,8 +447,24 @@ def make_patches_for_dataset(
         if nfeat == 0:
             raise RuntimeError("No features after explode")
 
-        center_feat_idx = rng.choice(nfeat, size=center_target, replace=(center_target > nfeat))
-        boundary_feat_idx = rng.choice(nfeat, size=boundary_target, replace=(boundary_target > nfeat))
+        field_id_source = "generated_from_feat_index"
+        field_ids: List[str] = [f"{ds_name}::{i}" for i in range(nfeat)]
+        if vector_id_field and vector_id_field in gdf.columns:
+            field_id_source = f"vector_id_field:{vector_id_field}"
+            raw_vals = gdf[vector_id_field]
+            for i in range(nfeat):
+                v = raw_vals.iloc[i]
+                s = str(v).strip() if v is not None else ""
+                if s and s.lower() not in {"none", "nan"}:
+                    field_ids[i] = f"{ds_name}::{s}"
+        elif "orig_fid" in gdf.columns:
+            field_id_source = "orig_fid"
+            raw_vals = gdf["orig_fid"]
+            for i in range(nfeat):
+                v = raw_vals.iloc[i]
+                s = str(v).strip() if v is not None else ""
+                if s and s.lower() not in {"none", "nan"}:
+                    field_ids[i] = f"{ds_name}::{s}"
 
         def sample_point_in_poly(poly) -> Optional[Point]:
             minx, miny, maxx, maxy = poly.bounds
@@ -584,6 +601,7 @@ def make_patches_for_dataset(
                 "patch_id": base,
                 "inside_mode": inside_mode,  # center | boundary | negative
                 "feat_index": int(feat_i) if feat_i is not None else None,
+                "field_id": (str(field_ids[int(feat_i)]) if feat_i is not None else None),
                 "xoff": int(win.col_off),
                 "yoff": int(win.row_off),
                 "w": int(win.width),
@@ -630,7 +648,11 @@ def make_patches_for_dataset(
 
         # ---- Positive: center ----
         patch_idx = 0
-        for fi in center_feat_idx:
+        center_attempts = 0
+        max_center_attempts = max(center_target * 50, 2000)
+        while written_center < center_target and center_attempts < max_center_attempts:
+            center_attempts += 1
+            fi = int(rng.integers(0, nfeat))
             poly = gdf.geometry.iloc[int(fi)]
             p = sample_point_in_poly(poly)
             if p is None:
@@ -649,7 +671,11 @@ def make_patches_for_dataset(
 
         # ---- Positive: boundary ----
         jitter_m = max(1.0, 0.10 * patch_w * pix_m)  # ~10% patch size
-        for fi in boundary_feat_idx:
+        boundary_attempts = 0
+        max_boundary_attempts = max(boundary_target * 50, 2000)
+        while written_boundary < boundary_target and boundary_attempts < max_boundary_attempts:
+            boundary_attempts += 1
+            fi = int(rng.integers(0, nfeat))
             poly = gdf.geometry.iloc[int(fi)]
             p0 = sample_point_on_boundary(poly)
             if p0 is None:
@@ -671,15 +697,15 @@ def make_patches_for_dataset(
         min_dist = float(cfg.negatives_min_dist_m)
         is_too_close = _build_negative_distance_checker(ds, union_geom, min_dist_m=min_dist)
 
-        attempts = 0
-        max_attempts = max(neg_target * 50, 5000)
+        neg_attempts = 0
+        max_neg_attempts = max(neg_target * 50, 5000)
         col_min = int(patch_w // 2)
         col_max = int(ds.width - (patch_w - patch_w // 2))
         row_min = int(patch_h // 2)
         row_max = int(ds.height - (patch_h - patch_h // 2))
 
-        while written_neg < neg_target and attempts < max_attempts:
-            attempts += 1
+        while written_neg < neg_target and neg_attempts < max_neg_attempts:
+            neg_attempts += 1
             col = int(rng.integers(col_min, col_max + 1))
             row = int(rng.integers(row_min, row_max + 1))
 
@@ -711,6 +737,8 @@ def make_patches_for_dataset(
             "raster": str(raster_path),
             "vector": str(vector_path),
             "vector_layer": vector_layer,
+            "vector_id_field": vector_id_field,
+            "field_id_source": field_id_source,
             "written_total": int(written),
             "written_center": int(written_center),
             "written_boundary": int(written_boundary),
@@ -721,6 +749,16 @@ def make_patches_for_dataset(
                 "center_target": int(center_target),
                 "boundary_target": int(boundary_target),
                 "neg_target": int(neg_target),
+            },
+            "attempts": {
+                "center": int(center_attempts),
+                "boundary": int(boundary_attempts),
+                "negative": int(neg_attempts),
+            },
+            "shortfall": {
+                "center": int(max(0, center_target - written_center)),
+                "boundary": int(max(0, boundary_target - written_boundary)),
+                "negative": int(max(0, neg_target - written_neg)),
             },
             "rejects": rejects,
             "nodata_policy": {

@@ -145,6 +145,19 @@ def predict_aoi_raster(
     nodata_rule: str = "control-band",
     control_band_1based: int = 1,
 ) -> Dict[str, object]:
+    window_size = int(window_size)
+    stride = int(stride)
+    batch_size = int(batch_size)
+
+    if window_size <= 0:
+        raise ValueError(f"window_size must be > 0, got {window_size}")
+    if stride <= 0:
+        raise ValueError(f"stride must be > 0, got {stride}")
+    if stride > window_size:
+        raise ValueError(f"stride must be <= window_size to avoid coverage gaps, got stride={stride}, window_size={window_size}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+
     model.eval()
 
     with rasterio.open(aoi_raster_path) as ds:
@@ -159,7 +172,7 @@ def predict_aoi_raster(
 
         device = torch.device(plan.device)
 
-        for group in _batch_iter(tiles, max(1, int(batch_size))):
+        for group in _batch_iter(tiles, batch_size):
             chips = []
             valid_masks = []
             valid_hw = []

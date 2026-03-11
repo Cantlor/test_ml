@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from net_train.hardware import RuntimePlan, amp_dtype_from_plan
 from net_train.losses.bwbl_loss import boundary_bwbl_loss
 from net_train.losses.extent_loss import extent_loss
-from net_train.metrics.boundary_metrics import boundary_metrics_multi_threshold
+from net_train.metrics.boundary_metrics import boundary_f1_dilated
 from net_train.metrics.extent_metrics import extent_binary_metrics
 from net_train.train.checkpoint import CheckpointManager
 from net_train.utils.io import append_csv_row
@@ -32,6 +32,35 @@ def _autocast_context(plan: RuntimePlan):
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=amp_dtype_from_plan(plan))
 
+
+
+def _optimizer_step(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: Optional[torch.cuda.amp.GradScaler],
+    grad_clip: float,
+) -> None:
+    if grad_clip > 0:
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def _safe_ratio(num: float, den: float, default: float) -> float:
+    return float(num / den) if den > 0 else float(default)
+
+
+def _f1_from_counts(tp: float, fp: float, fn: float) -> float:
+    precision = _safe_ratio(tp, tp + fp, 1.0)
+    recall = _safe_ratio(tp, tp + fn, 1.0)
+    return _safe_ratio(2.0 * precision * recall, precision + recall, 0.0)
 
 
 def _loss_and_components(
@@ -88,6 +117,7 @@ def train_one_epoch(
 
     grad_clip = float(train_section.get("grad_clip_norm", 0.0))
     grad_accum = int(batch_section.get("grad_accum_steps", 1))
+    accum_steps = max(1, grad_accum)
     log_every = int(train_section.get("log_every_n_steps", 20))
     log_smooth_window = int(train_section.get("log_smoothing_window", log_every if log_every > 0 else 20))
     log_smooth_window = max(1, log_smooth_window)
@@ -101,14 +131,15 @@ def train_one_epoch(
     recent_boundary = deque(maxlen=log_smooth_window)
 
     optimizer.zero_grad(set_to_none=True)
+    device = torch.device(plan.device)
 
     for step_idx, batch in enumerate(loader, start=1):
-        batch = _to_device(batch, device=torch.device(plan.device))
+        batch = _to_device(batch, device=device)
 
         with _autocast_context(plan):
             out = model(batch["image"])
             loss, info = _loss_and_components(out, batch, loss_cfg)
-            loss_scaled = loss / max(1, grad_accum)
+            loss_scaled = loss / accum_steps
 
         if not torch.isfinite(loss):
             logger.warning(
@@ -122,19 +153,8 @@ def train_one_epoch(
         else:
             loss_scaled.backward()
 
-        if step_idx % grad_accum == 0:
-            if grad_clip > 0:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-
-            optimizer.zero_grad(set_to_none=True)
+        if step_idx % accum_steps == 0:
+            _optimizer_step(model=model, optimizer=optimizer, scaler=scaler, grad_clip=grad_clip)
 
         steps += 1
         running_loss += float(info["loss"])
@@ -153,17 +173,8 @@ def train_one_epoch(
             )
 
     # flush leftover gradients
-    if steps % grad_accum != 0:
-        if grad_clip > 0:
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+    if steps % accum_steps != 0:
+        _optimizer_step(model=model, optimizer=optimizer, scaler=scaler, grad_clip=grad_clip)
 
     avg_loss = running_loss / max(1, steps)
     return {
@@ -199,10 +210,13 @@ def validate_one_epoch(
     # aggregate confusion terms for stable epoch-level metrics
     tp_e = fp_e = fn_e = 0.0
 
-    boundary_f1_acc: Dict[float, List[float]] = {t: [] for t in boundary_thresholds}
+    boundary_counts: Dict[float, Dict[str, float]] = {
+        t: {"tp": 0.0, "fp": 0.0, "fn": 0.0} for t in boundary_thresholds
+    }
+    device = torch.device(plan.device)
 
     for batch in loader:
-        batch = _to_device(batch, device=torch.device(plan.device))
+        batch = _to_device(batch, device=device)
 
         with _autocast_context(plan):
             out = model(batch["image"])
@@ -221,20 +235,20 @@ def validate_one_epoch(
         fp_e += m_extent["extent_fp"]
         fn_e += m_extent["extent_fn"]
 
-        m_boundary = boundary_metrics_multi_threshold(
-            logits=out["boundary_logits"],
-            target=batch["boundary"],
-            thresholds=boundary_thresholds,
-            ignore_value=boundary_ignore,
-            dilation_px=boundary_dilation,
-        )
         for t in boundary_thresholds:
-            boundary_f1_acc[t].append(float(m_boundary[f"boundary@{t:.2f}_f1"]))
+            m_boundary = boundary_f1_dilated(
+                logits=out["boundary_logits"],
+                target=batch["boundary"],
+                threshold=float(t),
+                ignore_value=boundary_ignore,
+                dilation_px=boundary_dilation,
+            )
+            boundary_counts[t]["tp"] += float(m_boundary["boundary_tp"])
+            boundary_counts[t]["fp"] += float(m_boundary["boundary_fp"])
+            boundary_counts[t]["fn"] += float(m_boundary["boundary_fn"])
 
-    iou = float(tp_e / (tp_e + fp_e + fn_e)) if (tp_e + fp_e + fn_e) > 0 else 1.0
-    precision = float(tp_e / (tp_e + fp_e)) if (tp_e + fp_e) > 0 else 1.0
-    recall = float(tp_e / (tp_e + fn_e)) if (tp_e + fn_e) > 0 else 1.0
-    f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    iou = _safe_ratio(tp_e, tp_e + fp_e + fn_e, 1.0)
+    f1 = _f1_from_counts(tp_e, fp_e, fn_e)
 
     out_metrics: Dict[str, float] = {
         "val/loss": float(loss_sum / max(1, steps)),
@@ -243,8 +257,10 @@ def validate_one_epoch(
     }
 
     for t in boundary_thresholds:
-        vals = boundary_f1_acc[t]
-        out_metrics[f"val/boundary_f1@{t:.2f}"] = float(sum(vals) / max(1, len(vals)))
+        tp_b = float(boundary_counts[t]["tp"])
+        fp_b = float(boundary_counts[t]["fp"])
+        fn_b = float(boundary_counts[t]["fn"])
+        out_metrics[f"val/boundary_f1@{t:.2f}"] = _f1_from_counts(tp_b, fp_b, fn_b)
 
     return out_metrics
 
@@ -266,7 +282,10 @@ def run_training(
     epochs = int(train_section.get("epochs", 1))
 
     use_scaler = plan.device == "cuda" and plan.amp_enabled and plan.amp_dtype == "float16"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     history: List[Dict[str, float]] = []
 

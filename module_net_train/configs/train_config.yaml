@@ -65,8 +65,8 @@ model:
   out_heads:
     extent: 1
     boundary: 1
-  # Под 4GB VRAM безопаснее начать с 16
-  base_channels: 16
+  # Более ёмкая модель для стабильнее/чётче контуров
+  base_channels: 24
   depth: 4
   norm: batchnorm
   dropout: 0.0
@@ -74,7 +74,7 @@ model:
 loss:
   weights:
     extent: 1.0
-    boundary: 3.0
+    boundary: 8.0
 
   extent:
     bce_weight: 1.0
@@ -92,28 +92,28 @@ metrics:
     compute_f1: true
 
   boundary:
-    # удобно сразу видеть две точки: "строгую" и "как в постпроцессе"
-    thresholds: [0.50, 0.35]
-    dilation_px: 2
+    # Расширенный набор порогов для подбора более чёткой границы
+    thresholds: [0.60, 0.50, 0.40, 0.35, 0.30, 0.25, 0.15]
+    dilation_px: 1
     compute_f1: true
 
 train:
   seed: 123
   deterministic: false
 
-  epochs: 20
+  epochs: 60
   # Можно переключить на iters, если хочешь строгий контроль:
   # max_steps: null
 
   optimizer:
     name: adamw
-    lr: 0.001
+    lr: 0.0007
     weight_decay: 0.0001
 
   scheduler:
     name: cosine
     warmup_epochs: 2
-    min_lr: 0.00001
+    min_lr: 0.000005
 
   grad_clip_norm: 1.0
 
@@ -129,7 +129,7 @@ train:
   checkpoint:
     save_last: true
     save_best: true
-    monitor: val/extent_iou
+    monitor: val/boundary_f1@0.50
     mode: max
 
 inference:

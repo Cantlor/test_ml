@@ -71,19 +71,19 @@ patching:
   patch_size_px: 512
   train_crop_px: 256
   pad_px: 16
-  target_patches_per_dataset: 800
+  target_patches_per_dataset: 2600
 
   sampling:
     mode: mixed
     weights:
-      center: 0.6
-      boundary: 0.4
+      center: 0.35
+      boundary: 0.65
     samples_per_feature: 1
 
     negatives:
       enabled: true
-      ratio: 0.15
-      min_distance_to_fields_m: 15
+      ratio: 0.28
+      min_distance_to_fields_m: 6
 
     # ✅ НОВОЕ: near-NoData квота
     near_nodata:
@@ -96,7 +96,7 @@ patching:
     min_valid_ratio: 0.50
     min_mask_ratio: 0.03
     max_mask_ratio: 0.90
-    neg_max_mask_ratio: 0.01
+    neg_max_mask_ratio: 0.05
 
 labels:
   build_extent: true
@@ -113,13 +113,13 @@ labels:
     background_value: 0
     skeleton_value: 1
     buffer_value: 2
-    buffer_px: 3
+    buffer_px: 2
 
   ignore_zone:
     enabled: true
     ignore_value: 255
-    # ⚠️ было 4 — по spec нужно 7 (≈20 м)
-    ignore_radius_px: 7
+    # Чуть уже ignore-зона, чтобы оставить больше supervision около границы
+    ignore_radius_px: 5
     apply_to_extent: true
 
   # ✅ НОВОЕ: NoData ignore policy на таргеты
