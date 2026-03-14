@@ -71,7 +71,7 @@ patching:
   patch_size_px: 512
   train_crop_px: 256
   pad_px: 16
-  target_patches_per_dataset: 2600
+  target_patches_per_dataset: 1000
 
   sampling:
     mode: mixed
@@ -82,8 +82,8 @@ patching:
 
     negatives:
       enabled: true
-      ratio: 0.28
-      min_distance_to_fields_m: 6
+      ratio: 0.15
+      min_distance_to_fields_m: 3
 
     # ✅ НОВОЕ: near-NoData квота
     near_nodata:
@@ -96,7 +96,7 @@ patching:
     min_valid_ratio: 0.50
     min_mask_ratio: 0.03
     max_mask_ratio: 0.90
-    neg_max_mask_ratio: 0.05
+    neg_max_mask_ratio: 0.1
 
 labels:
   build_extent: true

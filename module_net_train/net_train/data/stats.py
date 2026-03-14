@@ -61,6 +61,8 @@ def compute_normalization_stats(
     per_band: bool,
     nodata_value: float | None,
     ignore_nodata: bool,
+    nodata_rule: str = "control-band",
+    control_band_1based: int = 1,
     p_low: float = 2.0,
     p_high: float = 98.0,
     max_pixels_per_image: int = 25000,
@@ -73,6 +75,9 @@ def compute_normalization_stats(
         raise RuntimeError("Cannot compute normalization stats from empty record list")
 
     samples = []
+    rule = str(nodata_rule or "control-band").strip().lower()
+    cb = max(0, int(control_band_1based) - 1)
+
     for rec in records:
         with rasterio.open(rec.img_path) as ds:
             img = ds.read().astype(np.float32)
@@ -89,7 +94,12 @@ def compute_normalization_stats(
             with rasterio.open(valid_path) as ds:
                 valid = (ds.read(1) > 0).astype(np.uint8)
         elif nodata_value is not None:
-            valid = (~np.all(img == float(nodata_value), axis=0)).astype(np.uint8)
+            if rule == "all-bands":
+                nodata_mask = np.all(img == float(nodata_value), axis=0)
+            else:
+                b = max(0, min(cb, img.shape[0] - 1))
+                nodata_mask = (img[b] == float(nodata_value))
+            valid = (~nodata_mask).astype(np.uint8)
 
         sampled = _sample_pixels_with_valid(
             img=img,

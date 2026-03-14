@@ -6,7 +6,8 @@ paths:
   # Запускаем скрипты из module_net_train/, поэтому ".." — это корень проекта
   prep_data_root: ../prep_data
   prep_work_root: ../output_data/module_prep_data_work
-  aoi_manifest: ../output_data/module_prep_data_work/aoi_rasters_manifest.json
+  # Preferred strict manifest from module_prep_data MVP refactor.
+  aoi_manifest: ../output_data/module_prep_data_work/aoi_manifest.json
   runs_root: ../output_data/module_net_train/runs
 
 dataset:
@@ -50,14 +51,36 @@ augmentations:
   hflip: true
   vflip: true
   rotate90: true
+  invalid_edge_sim:
+    # Редкая train-only симуляция invalid-краёв для устойчивости около AOI/NoData границ.
+    enabled: true
+    prob: 0.12
+    min_width_px: 12
+    max_width_px: 64
+    block_prob: 0.35
+    max_area_ratio: 0.18
+    zero_image: true
   # Если позже понадобится:
   # brightness_contrast: 0.0
 
 sampling:
   # Из файлов img_* (обычно 512) берём random crop под GPU
   crop_size: 256
-  # Если захочешь: можно добавить oversample_boundary / oversample_positive позже
-  # strategy: uniform
+  crop_policy:
+    # Несколько попыток повышают шанс взять crop с boundary-positive пикселями.
+    attempts: 8
+    min_extent_pixels: 32
+    min_boundary_pixels: 24
+    # Если квоты не выполнены, чаще берём best-effort crop, но оставляем долю случайных.
+    fallback_to_best_prob: 0.80
+    near_invalid:
+      # Мягкий bias: часть train-crop'ов целимся в valid/invalid transition зоны.
+      enabled: true
+      enforce_prob: 0.30
+      min_pixels: 64
+      radius_px: 2
+      # Диагностический радиус в train-логах (near_invalid_ratio).
+      diag_radius_px: 2
 
 model:
   name: unet_multitask
@@ -68,7 +91,8 @@ model:
   # Более ёмкая модель для стабильнее/чётче контуров
   base_channels: 24
   depth: 4
-  norm: batchnorm
+  # Для фактического micro-batch=1 обычно устойчивее, чем batchnorm.
+  norm: instancenorm
   dropout: 0.0
 
 loss:
@@ -84,6 +108,14 @@ loss:
   boundary_bwbl:
     # BCE по skeleton (1), buffer (2) игнорируется
     ignore_value: 2
+    # Для редких skeleton-positive пикселей.
+    pos_weight: auto
+    # Умеренный focal помогает против доминирования фона.
+    focal_gamma: 1.0
+    bce_weight: 1.0
+    # Мягкий dice-терм повышает устойчивость на тонких границах.
+    dice_weight: 0.25
+    dice_smooth: 1.0
 
 metrics:
   extent:
@@ -93,15 +125,15 @@ metrics:
 
   boundary:
     # Расширенный набор порогов для подбора более чёткой границы
-    thresholds: [0.60, 0.50, 0.40, 0.35, 0.30, 0.25, 0.15]
+    thresholds: [0.70, 0.65, 0.60, 0.55, 0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20, 0.15]
     dilation_px: 1
     compute_f1: true
 
 train:
-  seed: 123
+  seed: 203
   deterministic: false
 
-  epochs: 60
+  epochs: 20
   # Можно переключить на iters, если хочешь строгий контроль:
   # max_steps: null
 
@@ -129,7 +161,8 @@ train:
   checkpoint:
     save_last: true
     save_best: true
-    monitor: val/boundary_f1@0.50
+    # Robust to threshold drift across runs.
+    monitor: val/boundary_f1_max
     mode: max
 
 inference:
@@ -139,7 +172,7 @@ inference:
   aoi:
     # Сейчас работаем с first_raster (ключ должен совпадать с manifest'ом из module_prep_data)
     dataset_key: first_raster
-    aoi_manifest: ../output_data/module_prep_data_work/aoi_rasters_manifest.json
+    aoi_manifest: ../output_data/module_prep_data_work/aoi_manifest.json
 
   tiling:
     # Безопасные размеры под 4GB, без швов за счёт overlap
@@ -148,7 +181,18 @@ inference:
     # Если нужно — можно сделать меньше (window 384 / stride 256)
     batch_size: auto
 
-    blend: mean   # mean | gaussian (если сделаем позже)
+    # Center-weighted blending заметно уменьшает tile seams.
+    blend: gaussian   # mean | gaussian
+    gaussian_sigma: 0.30
+    gaussian_min_weight: 0.05
+
+    # Опциональный guardrail: мягко ослабляет шумовые ответы рядом с invalid-границей.
+    # По умолчанию выключен для максимально безопасной совместимости.
+    invalid_edge_guard:
+      enabled: false
+      radius_px: 2
+      extent_scale: 0.90
+      boundary_scale: 0.75
 
   outputs:
     extent_prob_name: extent_prob.tif

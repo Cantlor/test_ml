@@ -11,17 +11,19 @@ from rich.console import Console
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from net_train.config import load_hardware_config, load_train_config
+from net_train.config import load_hardware_config, load_train_config, resolve_run_train_config_path
 from net_train.data import AugmentConfig, DatasetOptions, PatchDataset, build_index, load_stats_npz
 from net_train.hardware import apply_torch_runtime_flags, build_runtime_plan
 from net_train.models import build_model
 from net_train.train import load_checkpoint, validate_one_epoch
 from net_train.utils.io import write_json
 from net_train.utils.logging import setup_logger
+from net_train.utils.seed import make_torch_generator, seed_dataloader_worker
 
 
 
-def _make_loader(dataset, plan):
+def _make_loader(dataset, plan, base_seed: int):
+    generator = make_torch_generator(int(base_seed + 3000))
     kwargs = {
         "batch_size": int(plan.batch_size),
         "shuffle": False,
@@ -30,8 +32,11 @@ def _make_loader(dataset, plan):
         "persistent_workers": bool(plan.persistent_workers and plan.num_workers > 0),
         "drop_last": False,
     }
+    if generator is not None:
+        kwargs["generator"] = generator
     if plan.num_workers > 0:
         kwargs["prefetch_factor"] = int(plan.prefetch_factor)
+        kwargs["worker_init_fn"] = seed_dataloader_worker
     return DataLoader(dataset, **kwargs)
 
 
@@ -48,20 +53,30 @@ def main() -> int:
     console = Console()
     logger = setup_logger("eval", level=args.log_level)
 
-    train_cfg = load_train_config(args.config)
+    run_dir = Path(args.run_dir).resolve()
+    train_config_path, used_run_config = resolve_run_train_config_path(args.config, run_dir)
+    train_cfg = load_train_config(train_config_path)
     hw_cfg = load_hardware_config(args.hardware)
     plan = build_runtime_plan(train_cfg, hw_cfg)
     apply_torch_runtime_flags(plan)
+    if used_run_config:
+        logger.info(f"Using run-resolved config: {train_config_path}")
+    else:
+        logger.warning(
+            f"config_resolved.yaml not found in run_dir; using CLI config: {train_config_path}"
+        )
 
-    run_dir = Path(args.run_dir).resolve()
     stats_path = run_dir / "band_stats.npz"
     if not stats_path.exists():
         raise RuntimeError(f"Missing normalization stats: {stats_path}")
     norm_stats = load_stats_npz(stats_path)
 
     ckpt_path = Path(args.checkpoint).resolve() if args.checkpoint else (run_dir / "checkpoints" / "best.pt")
+    checkpoint_fallback_used = False
     if not ckpt_path.exists():
         ckpt_path = run_dir / "checkpoints" / "last.pt"
+        checkpoint_fallback_used = True
+        logger.warning("best.pt not found, falling back to last.pt for eval: %s", ckpt_path)
     if not ckpt_path.exists():
         raise RuntimeError(f"Checkpoint not found in {run_dir / 'checkpoints'}")
 
@@ -114,9 +129,10 @@ def main() -> int:
             control_band_1based=control_band_1based,
         ),
         augment_cfg=AugmentConfig(enabled=False),
-        seed=123,
+        seed=int((train_cfg.raw.get("train", {}) or {}).get("seed", 123)),
     )
-    test_loader = _make_loader(test_ds, plan)
+    seed = int((train_cfg.raw.get("train", {}) or {}).get("seed", 123))
+    test_loader = _make_loader(test_ds, plan, base_seed=seed)
 
     model = build_model(train_cfg.raw.get("model", {}) or {})
     model = model.to(torch.device(plan.device))
@@ -133,8 +149,10 @@ def main() -> int:
 
     out = {
         "checkpoint": str(ckpt_path),
+        "config_used": str(train_config_path),
         "run_dir": str(run_dir),
         "split": "test",
+        "checkpoint_fallback_used": bool(checkpoint_fallback_used),
         "metrics": metrics,
     }
     out_path = run_dir / "metrics" / "eval_test.json"

@@ -19,6 +19,12 @@ def _norm_layer(norm: str, channels: int) -> nn.Module:
         return nn.BatchNorm2d(channels)
     if norm == "instancenorm":
         return nn.InstanceNorm2d(channels, affine=True)
+    if norm == "groupnorm":
+        # Prefer more groups for richer normalization statistics, but keep divisibility.
+        groups = min(32, int(channels))
+        while groups > 1 and (int(channels) % groups) != 0:
+            groups -= 1
+        return nn.GroupNorm(num_groups=max(1, groups), num_channels=int(channels))
     return nn.Identity()
 
 

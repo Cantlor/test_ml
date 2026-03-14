@@ -16,6 +16,23 @@ from net_train.utils.io import read_json
 
 
 def _resolve_from_manifest_obj(obj: object, dataset_key: str) -> Path | None:
+    # Preferred strict manifest from module_prep_data:
+    # {"datasets": [{"dataset": "...", "status": "clipped", "aoi_raster_path": "..."}]}
+    if isinstance(obj, dict) and isinstance(obj.get("datasets"), list):
+        for it in obj["datasets"]:
+            if not isinstance(it, dict):
+                continue
+            if str(it.get("dataset")) != dataset_key:
+                continue
+            status = str(it.get("status", "")).strip().lower()
+            aoi_path = it.get("aoi_raster_path")
+            if status and status != "clipped":
+                continue
+            if isinstance(aoi_path, str) and aoi_path.strip():
+                candidate = Path(aoi_path).resolve()
+                if candidate.exists():
+                    return candidate
+
     # Preferred contract: {"dataset_key": "/abs/path/to/aoi.tif"}
     if isinstance(obj, dict) and dataset_key in obj and isinstance(obj[dataset_key], str):
         candidate = Path(obj[dataset_key]).resolve()
@@ -35,14 +52,25 @@ def _resolve_from_manifest_obj(obj: object, dataset_key: str) -> Path | None:
 
 
 def resolve_aoi_path(manifest_path: Path, dataset_key: str) -> Path:
+    manifest_path = Path(manifest_path).resolve()
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"AOI manifest not found: {manifest_path}")
+
     obj = read_json(manifest_path)
     resolved = _resolve_from_manifest_obj(obj, dataset_key)
     if resolved is not None:
         return resolved
 
-    # Fallback: module_prep_data currently writes manifest into aoi_rasters/aoi_rasters_manifest.json.
-    alt = manifest_path.parent / "aoi_rasters" / "aoi_rasters_manifest.json"
-    if alt.exists():
+    # Backward-compatible fallbacks for older layouts.
+    checked = [manifest_path]
+    alt_candidates = [
+        manifest_path.parent / "aoi_rasters_manifest.json",
+        manifest_path.parent / "aoi_rasters" / "aoi_rasters_manifest.json",
+    ]
+    for alt in alt_candidates:
+        if alt in checked or not alt.exists():
+            continue
+        checked.append(alt)
         alt_obj = read_json(alt)
         resolved = _resolve_from_manifest_obj(alt_obj, dataset_key)
         if resolved is not None:
@@ -50,7 +78,7 @@ def resolve_aoi_path(manifest_path: Path, dataset_key: str) -> Path:
 
     raise KeyError(
         f"Cannot resolve existing AOI path for dataset_key='{dataset_key}'. "
-        f"Checked manifests: {manifest_path} and {alt if alt.exists() else 'n/a'}"
+        f"Checked manifests: {', '.join(str(p) for p in checked)}"
     )
 
 
@@ -80,6 +108,47 @@ def _valid_mask_from_chip(
         b = max(0, min(b, chip.shape[0] - 1))
         is_nodata = (chip[b] == float(nodata_value))
     return (~is_nodata).astype(np.uint8)
+
+
+def _dilate_8(mask: np.ndarray) -> np.ndarray:
+    p = np.pad(mask.astype(bool), 1, mode="constant", constant_values=False)
+    return (
+        p[1:-1, 1:-1]
+        | p[:-2, 1:-1]
+        | p[2:, 1:-1]
+        | p[1:-1, :-2]
+        | p[1:-1, 2:]
+        | p[:-2, :-2]
+        | p[:-2, 2:]
+        | p[2:, :-2]
+        | p[2:, 2:]
+    )
+
+
+def _invalid_edge_band(valid_mask: np.ndarray, radius_px: int) -> np.ndarray:
+    """
+    Build a narrow valid-side band around invalid pixels.
+    Returns bool mask on valid pixels within `radius_px` from invalid area.
+    """
+    radius = int(radius_px)
+    if radius <= 0:
+        return np.zeros_like(valid_mask, dtype=bool)
+
+    invalid = (valid_mask == 0)
+    if not np.any(invalid):
+        return np.zeros_like(valid_mask, dtype=bool)
+
+    grown = invalid.copy()
+    for _ in range(radius):
+        grown = _dilate_8(grown)
+    return (valid_mask == 1) & grown
+
+
+def _validate_scale_01(name: str, value: float) -> float:
+    v = float(value)
+    if v < 0.0 or v > 1.0:
+        raise ValueError(f"{name} must be in [0,1], got {value}")
+    return v
 
 
 def _prepare_chip(
@@ -135,6 +204,8 @@ def predict_aoi_raster(
     stride: int,
     batch_size: int,
     blend: str = "mean",
+    gaussian_sigma: float = 0.30,
+    gaussian_min_weight: float = 0.05,
     out_dtype: str = "float32",
     compress: str = "DEFLATE",
     tiled: bool = True,
@@ -144,6 +215,9 @@ def predict_aoi_raster(
     nodata_value: float | None = 65536.0,
     nodata_rule: str = "control-band",
     control_band_1based: int = 1,
+    invalid_edge_guard_px: int = 0,
+    invalid_edge_extent_scale: float = 1.0,
+    invalid_edge_boundary_scale: float = 1.0,
 ) -> Dict[str, object]:
     window_size = int(window_size)
     stride = int(stride)
@@ -157,6 +231,11 @@ def predict_aoi_raster(
         raise ValueError(f"stride must be <= window_size to avoid coverage gaps, got stride={stride}, window_size={window_size}")
     if batch_size <= 0:
         raise ValueError(f"batch_size must be > 0, got {batch_size}")
+    guard_px = int(invalid_edge_guard_px)
+    if guard_px < 0:
+        raise ValueError(f"invalid_edge_guard_px must be >= 0, got {invalid_edge_guard_px}")
+    guard_extent_scale = _validate_scale_01("invalid_edge_extent_scale", invalid_edge_extent_scale)
+    guard_boundary_scale = _validate_scale_01("invalid_edge_boundary_scale", invalid_edge_boundary_scale)
 
     model.eval()
 
@@ -169,6 +248,8 @@ def predict_aoi_raster(
         acc_extent = np.zeros((height, width), dtype=np.float32)
         acc_boundary = np.zeros((height, width), dtype=np.float32)
         acc_weight = np.zeros((height, width), dtype=np.float32)
+        weight_cache: dict[tuple[int, int], np.ndarray] = {}
+        guard_applied_pixels = 0
 
         device = torch.device(plan.device)
 
@@ -228,7 +309,25 @@ def predict_aoi_raster(
                 e[valid == 0] = 0.0
                 b[valid == 0] = 0.0
 
-                ww = blend_weights(h=h, w=w, mode=blend)
+                if guard_px > 0 and (guard_extent_scale < 1.0 or guard_boundary_scale < 1.0):
+                    edge_band = _invalid_edge_band(valid, radius_px=guard_px)
+                    if np.any(edge_band):
+                        guard_applied_pixels += int(edge_band.sum())
+                        if guard_extent_scale < 1.0:
+                            e[edge_band] *= guard_extent_scale
+                        if guard_boundary_scale < 1.0:
+                            b[edge_band] *= guard_boundary_scale
+
+                ww = weight_cache.get((h, w))
+                if ww is None:
+                    ww = blend_weights(
+                        h=h,
+                        w=w,
+                        mode=blend,
+                        gaussian_sigma=gaussian_sigma,
+                        gaussian_min_weight=gaussian_min_weight,
+                    )
+                    weight_cache[(h, w)] = ww
 
                 y0, y1 = tile.y, tile.y + h
                 x0, x1 = tile.x, tile.x + w
@@ -278,4 +377,12 @@ def predict_aoi_raster(
         "window_size": int(window_size),
         "stride": int(stride),
         "blend": blend,
+        "gaussian_sigma": float(gaussian_sigma),
+        "gaussian_min_weight": float(gaussian_min_weight),
+        "invalid_edge_guard_px": int(guard_px),
+        "invalid_edge_extent_scale": float(guard_extent_scale),
+        "invalid_edge_boundary_scale": float(guard_boundary_scale),
+        "invalid_edge_guard_applied_pixels": int(guard_applied_pixels),
+        "overlap_px": int(max(0, window_size - stride)),
+        "overlap_ratio": float(max(0.0, min(1.0, (window_size - stride) / float(window_size)))),
     }

@@ -91,12 +91,23 @@ with cfg_path.open("r", encoding="utf-8") as f:
 patching = cfg.get("patching", {}) or {}
 split = cfg.get("split", {}) or {}
 ratios = split.get("ratios", {}) or {}
+paths = cfg.get("paths", {}) or {}
+
+work_dir = Path(paths.get("work_dir", "../output_data/module_prep_data_work"))
+if not work_dir.is_absolute():
+    work_dir = (cfg_path.parent / work_dir).resolve()
+
+prep_data_dir = Path(paths.get("prep_data_dir", "../prep_data"))
+if not prep_data_dir.is_absolute():
+    prep_data_dir = (cfg_path.parent / prep_data_dir).resolve()
 
 print(int(patching.get("target_patches_per_dataset", 800)))
 print(int(split.get("seed", 123)))
 print(float(ratios.get("train", 0.80)))
 print(float(ratios.get("validation", 0.10)))
 print(float(ratios.get("test", 0.10)))
+print(str(work_dir))
+print(str(prep_data_dir))
 PY
 )
 
@@ -105,6 +116,8 @@ CFG_SEED="${CFG_VALUES[1]}"
 CFG_TRAIN_RATIO="${CFG_VALUES[2]}"
 CFG_VAL_RATIO="${CFG_VALUES[3]}"
 CFG_TEST_RATIO="${CFG_VALUES[4]}"
+CFG_WORK_DIR="${CFG_VALUES[5]}"
+CFG_PREP_DATA_DIR="${CFG_VALUES[6]}"
 
 EFFECTIVE_N_PATCHES="${N_PATCHES:-${CFG_N_PATCHES}}"
 EFFECTIVE_SEED="${SEED:-${CFG_SEED}}"
@@ -120,6 +133,8 @@ echo "config:           ${CONFIG}"
 echo "n_patches:        ${EFFECTIVE_N_PATCHES} (${NP_SRC})"
 echo "seed:             ${EFFECTIVE_SEED} (${SEED_SRC})"
 echo "split_ratios:     train=${CFG_TRAIN_RATIO} val=${CFG_VAL_RATIO} test=${CFG_TEST_RATIO} (config)"
+echo "work_dir:         ${CFG_WORK_DIR}"
+echo "prep_data_dir:    ${CFG_PREP_DATA_DIR}"
 echo "split_mode:       $([[ \"${OVERWRITE}\" == \"1\" ]] && echo \"overwrite\" || echo \"append\")"
 
 # ---------- 01_check_inputs ----------
@@ -151,10 +166,9 @@ ok "03_make_patches finished"
 
 # ---------- 04_split_dataset ----------
 step "04_split_dataset.py (patches_all -> prep_data/*)"
-PATCHES_ALL="${PROJ_ROOT}/output_data/module_prep_data_work/patches_all"
-OUT_PREP="${PROJ_ROOT}/prep_data"
+PATCHES_ALL="${CFG_WORK_DIR}/patches_all"
 
-SPLIT_ARGS=( --patches_all "${PATCHES_ALL}" --out_prep_data "${OUT_PREP}" --seed "${EFFECTIVE_SEED}" --train "${CFG_TRAIN_RATIO}" --val "${CFG_VAL_RATIO}" --test "${CFG_TEST_RATIO}" )
+SPLIT_ARGS=( --config "${CONFIG}" --seed "${EFFECTIVE_SEED}" )
 if [[ "${OVERWRITE}" == "1" ]]; then
   SPLIT_ARGS+=( --overwrite )
 fi

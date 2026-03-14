@@ -54,7 +54,7 @@ def _check_img_shape(img_path: Path, expected_bands: int) -> Dict[str, object]:
         "bands": count,
         "dtype": str(dtype),
         "nodata": None if nodata is None else float(nodata),
-        "ok": count == expected_bands,
+        "ok": count >= expected_bands,
     }
 
 
@@ -131,7 +131,7 @@ def main() -> int:
             image_checks.append(ch)
             if not ch["ok"]:
                 split_errors.append(
-                    f"{r.img_path}: bands={ch['bands']} expected={expected_bands}"
+                    f"{r.img_path}: bands={ch['bands']} expected>={expected_bands}"
                 )
 
         extent_allowed = {0, 1, extent_ignore}

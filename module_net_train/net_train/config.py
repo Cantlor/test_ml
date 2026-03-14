@@ -107,7 +107,25 @@ def resolve_inference_manifest_path(train_cfg: TrainConfig) -> Path:
     if "aoi_manifest" in train_cfg.paths:
         return train_cfg.paths["aoi_manifest"]
 
+    # Preferred manifest in refactored module_prep_data.
+    strict_path = resolve_path_from_train_cfg(train_cfg, "../output_data/module_prep_data_work/aoi_manifest.json")
+    if strict_path.exists():
+        return strict_path
+
+    # Backward-compatible fallback.
     return resolve_path_from_train_cfg(train_cfg, "../output_data/module_prep_data_work/aoi_rasters_manifest.json")
+
+
+def resolve_run_train_config_path(config_path: str | Path, run_dir: str | Path) -> tuple[Path, bool]:
+    """
+    Prefer run_dir/config_resolved.yaml for eval/infer parity.
+    Returns (path, from_run_dir_flag).
+    """
+    rd = Path(run_dir).resolve()
+    resolved = rd / "config_resolved.yaml"
+    if resolved.exists():
+        return resolved, True
+    return Path(config_path).resolve(), False
 
 
 def dump_yaml(path: Path, obj: Dict[str, Any]) -> None:

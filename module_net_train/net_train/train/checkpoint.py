@@ -41,6 +41,12 @@ class CheckpointManager:
         return value > self.best_value
 
     def step(self, state: Dict[str, Any], metrics: Dict[str, float]) -> Dict[str, Any]:
+        if self.monitor not in metrics:
+            available = ", ".join(sorted(metrics.keys()))
+            raise KeyError(
+                f"Checkpoint monitor '{self.monitor}' is missing in metrics. "
+                f"Available keys: {available}"
+            )
         monitor_value = float(metrics.get(self.monitor, float("nan")))
         did_save_best = False
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List
+from typing import List
 
 import numpy as np
 
@@ -41,7 +41,13 @@ def generate_windows(width: int, height: int, window_size: int, stride: int) -> 
 
 
 
-def blend_weights(h: int, w: int, mode: str = "mean") -> np.ndarray:
+def blend_weights(
+    h: int,
+    w: int,
+    mode: str = "mean",
+    gaussian_sigma: float = 0.30,
+    gaussian_min_weight: float = 0.05,
+) -> np.ndarray:
     mode = mode.lower()
     if mode == "mean":
         return np.ones((h, w), dtype=np.float32)
@@ -51,9 +57,17 @@ def blend_weights(h: int, w: int, mode: str = "mean") -> np.ndarray:
         xx = np.linspace(-1.0, 1.0, w, dtype=np.float32)
         yv, xv = np.meshgrid(yy, xx, indexing="ij")
         rr2 = xv * xv + yv * yv
-        sigma2 = 0.30
+        sigma = float(gaussian_sigma)
+        if sigma <= 0.0:
+            raise ValueError(f"gaussian_sigma must be > 0, got {gaussian_sigma}")
+        sigma2 = sigma * sigma
         g = np.exp(-0.5 * rr2 / sigma2).astype(np.float32)
         g /= np.clip(g.max(), 1e-6, None)
+        min_w = float(gaussian_min_weight)
+        if min_w < 0.0:
+            raise ValueError(f"gaussian_min_weight must be >= 0, got {gaussian_min_weight}")
+        if min_w > 0.0:
+            g = np.maximum(g, min_w).astype(np.float32)
         return g
 
     raise ValueError(f"Unknown blend mode: {mode}")

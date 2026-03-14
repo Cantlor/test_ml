@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import math
 
 import torch
 from torch.utils.data import DataLoader
@@ -87,6 +88,11 @@ def _loss_and_components(
         logits=outputs["boundary_logits"],
         target=batch["boundary"],
         ignore_value=int(boundary_cfg.get("ignore_value", 2)),
+        pos_weight=boundary_cfg.get("pos_weight", None),
+        focal_gamma=float(boundary_cfg.get("focal_gamma", 0.0)),
+        bce_weight=float(boundary_cfg.get("bce_weight", 1.0)),
+        dice_weight=float(boundary_cfg.get("dice_weight", 0.0)),
+        dice_smooth=float(boundary_cfg.get("dice_smooth", 1.0)),
     )
 
     total = w_extent * extent_l + w_boundary * boundary_l
@@ -97,6 +103,17 @@ def _loss_and_components(
         **boundary_info,
     }
     return total, info
+
+
+def _batch_mean_scalar(x: Any) -> float:
+    if torch.is_tensor(x):
+        return float(x.detach().float().mean().item())
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, (list, tuple)) and len(x) > 0:
+        vals = [float(v) for v in x]
+        return float(sum(vals) / max(1, len(vals)))
+    return float("nan")
 
 
 
@@ -125,10 +142,21 @@ def train_one_epoch(
     loss_cfg = train_cfg.get("loss", {}) or {}
 
     running_loss = 0.0
+    running_extent = 0.0
+    running_boundary = 0.0
+    running_boundary_bce = 0.0
+    running_boundary_dice = 0.0
+    running_boundary_pos_weight = 0.0
+    running_boundary_pos_frac = 0.0
+    running_near_invalid_ratio = 0.0
+    running_valid_ratio = 0.0
+    running_synthetic_invalid_applied = 0.0
     steps = 0
     recent_loss = deque(maxlen=log_smooth_window)
     recent_extent = deque(maxlen=log_smooth_window)
     recent_boundary = deque(maxlen=log_smooth_window)
+    recent_near_invalid = deque(maxlen=log_smooth_window)
+    recent_synth = deque(maxlen=log_smooth_window)
 
     optimizer.zero_grad(set_to_none=True)
     device = torch.device(plan.device)
@@ -158,18 +186,37 @@ def train_one_epoch(
 
         steps += 1
         running_loss += float(info["loss"])
+        running_extent += float(info["extent_total"])
+        running_boundary += float(info["boundary_total"])
+        running_boundary_bce += float(info.get("boundary_bce", info["boundary_total"]))
+        running_boundary_dice += float(info.get("boundary_dice", 0.0))
+        running_boundary_pos_weight += float(info.get("boundary_pos_weight_used", 1.0))
+        running_boundary_pos_frac += float(info.get("boundary_pos_frac", 0.0))
+        near_invalid_ratio = _batch_mean_scalar(batch.get("near_invalid_ratio"))
+        valid_ratio = _batch_mean_scalar(batch.get("valid_ratio"))
+        synth_applied = _batch_mean_scalar(batch.get("synthetic_invalid_applied"))
+        running_near_invalid_ratio += 0.0 if not math.isfinite(near_invalid_ratio) else near_invalid_ratio
+        running_valid_ratio += 0.0 if not math.isfinite(valid_ratio) else valid_ratio
+        running_synthetic_invalid_applied += 0.0 if not math.isfinite(synth_applied) else synth_applied
         recent_loss.append(float(info["loss"]))
         recent_extent.append(float(info["extent_total"]))
         recent_boundary.append(float(info["boundary_total"]))
+        if math.isfinite(near_invalid_ratio):
+            recent_near_invalid.append(float(near_invalid_ratio))
+        if math.isfinite(synth_applied):
+            recent_synth.append(float(synth_applied))
 
         if log_every > 0 and step_idx % log_every == 0:
             avg_loss = sum(recent_loss) / max(1, len(recent_loss))
             avg_extent = sum(recent_extent) / max(1, len(recent_extent))
             avg_boundary = sum(recent_boundary) / max(1, len(recent_boundary))
+            avg_near = sum(recent_near_invalid) / max(1, len(recent_near_invalid))
+            avg_synth = sum(recent_synth) / max(1, len(recent_synth))
             logger.info(
                 f"epoch={epoch} step={step_idx}/{len(loader)} "
                 f"loss={info['loss']:.5f} extent={info['extent_total']:.5f} boundary={info['boundary_total']:.5f} "
-                f"| smooth{log_smooth_window}: loss={avg_loss:.5f} extent={avg_extent:.5f} boundary={avg_boundary:.5f}"
+                f"| smooth{log_smooth_window}: loss={avg_loss:.5f} extent={avg_extent:.5f} boundary={avg_boundary:.5f} "
+                f"near_invalid={avg_near:.3f} synth_applied={avg_synth:.3f}"
             )
 
     # flush leftover gradients
@@ -179,6 +226,15 @@ def train_one_epoch(
     avg_loss = running_loss / max(1, steps)
     return {
         "train/loss": avg_loss,
+        "train/extent_total": running_extent / max(1, steps),
+        "train/boundary_total": running_boundary / max(1, steps),
+        "train/boundary_bce": running_boundary_bce / max(1, steps),
+        "train/boundary_dice": running_boundary_dice / max(1, steps),
+        "train/boundary_pos_weight": running_boundary_pos_weight / max(1, steps),
+        "train/boundary_pos_frac": running_boundary_pos_frac / max(1, steps),
+        "train/near_invalid_ratio": running_near_invalid_ratio / max(1, steps),
+        "train/valid_ratio": running_valid_ratio / max(1, steps),
+        "train/synthetic_invalid_applied_rate": running_synthetic_invalid_applied / max(1, steps),
     }
 
 
@@ -197,6 +253,8 @@ def validate_one_epoch(
 
     extent_threshold = float(extent_cfg.get("threshold", 0.5))
     boundary_thresholds = [float(v) for v in boundary_cfg.get("thresholds", [0.5, 0.35])]
+    if not boundary_thresholds:
+        raise RuntimeError("metrics.boundary.thresholds must contain at least one value")
     boundary_dilation = int(boundary_cfg.get("dilation_px", 2))
 
     dataset_cfg = train_cfg.get("dataset", {}) or {}
@@ -213,6 +271,10 @@ def validate_one_epoch(
     boundary_counts: Dict[float, Dict[str, float]] = {
         t: {"tp": 0.0, "fp": 0.0, "fn": 0.0} for t in boundary_thresholds
     }
+    sum_boundary_prob_pos = 0.0
+    cnt_boundary_pos = 0.0
+    sum_boundary_prob_neg = 0.0
+    cnt_boundary_neg = 0.0
     device = torch.device(plan.device)
 
     for batch in loader:
@@ -234,6 +296,17 @@ def validate_one_epoch(
         tp_e += m_extent["extent_tp"]
         fp_e += m_extent["extent_fp"]
         fn_e += m_extent["extent_fn"]
+
+        prob_boundary = torch.sigmoid(out["boundary_logits"].squeeze(1))
+        valid_boundary = batch["boundary"] != boundary_ignore
+        pos_boundary = (batch["boundary"] == 1) & valid_boundary
+        neg_boundary = (batch["boundary"] == 0) & valid_boundary
+        if torch.any(pos_boundary):
+            sum_boundary_prob_pos += float(prob_boundary[pos_boundary].sum().item())
+            cnt_boundary_pos += float(pos_boundary.sum().item())
+        if torch.any(neg_boundary):
+            sum_boundary_prob_neg += float(prob_boundary[neg_boundary].sum().item())
+            cnt_boundary_neg += float(neg_boundary.sum().item())
 
         for t in boundary_thresholds:
             m_boundary = boundary_f1_dilated(
@@ -260,7 +333,23 @@ def validate_one_epoch(
         tp_b = float(boundary_counts[t]["tp"])
         fp_b = float(boundary_counts[t]["fp"])
         fn_b = float(boundary_counts[t]["fn"])
+        precision_b = _safe_ratio(tp_b, tp_b + fp_b, 1.0)
+        recall_b = _safe_ratio(tp_b, tp_b + fn_b, 1.0)
         out_metrics[f"val/boundary_f1@{t:.2f}"] = _f1_from_counts(tp_b, fp_b, fn_b)
+        out_metrics[f"val/boundary_precision@{t:.2f}"] = precision_b
+        out_metrics[f"val/boundary_recall@{t:.2f}"] = recall_b
+    if boundary_thresholds:
+        best_t = max(boundary_thresholds, key=lambda t: out_metrics[f"val/boundary_f1@{t:.2f}"])
+        out_metrics["val/boundary_f1_max"] = float(out_metrics[f"val/boundary_f1@{best_t:.2f}"])
+        out_metrics["val/boundary_f1_max_threshold"] = float(best_t)
+        out_metrics["val/boundary_precision_max"] = float(out_metrics[f"val/boundary_precision@{best_t:.2f}"])
+        out_metrics["val/boundary_recall_max"] = float(out_metrics[f"val/boundary_recall@{best_t:.2f}"])
+
+    pos_mean = _safe_ratio(sum_boundary_prob_pos, cnt_boundary_pos, 0.0)
+    neg_mean = _safe_ratio(sum_boundary_prob_neg, cnt_boundary_neg, 0.0)
+    out_metrics["val/boundary_prob_pos_mean"] = pos_mean
+    out_metrics["val/boundary_prob_neg_mean"] = neg_mean
+    out_metrics["val/boundary_prob_gap"] = float(pos_mean - neg_mean)
 
     return out_metrics
 
@@ -280,6 +369,25 @@ def run_training(
 ) -> List[Dict[str, float]]:
     train_section = train_cfg.get("train", {}) or {}
     epochs = int(train_section.get("epochs", 1))
+    val_every = max(1, int(train_section.get("val_every_epochs", 1)))
+    boundary_cfg = ((train_cfg.get("metrics", {}) or {}).get("boundary", {}) or {})
+    boundary_thresholds = [float(v) for v in boundary_cfg.get("thresholds", [0.5, 0.35])]
+    skipped_val_template: Dict[str, float] = {
+        "val/loss": float("nan"),
+        "val/extent_iou": float("nan"),
+        "val/extent_f1": float("nan"),
+        "val/boundary_f1_max": float("nan"),
+        "val/boundary_f1_max_threshold": float("nan"),
+        "val/boundary_precision_max": float("nan"),
+        "val/boundary_recall_max": float("nan"),
+        "val/boundary_prob_pos_mean": float("nan"),
+        "val/boundary_prob_neg_mean": float("nan"),
+        "val/boundary_prob_gap": float("nan"),
+    }
+    for t in boundary_thresholds:
+        skipped_val_template[f"val/boundary_f1@{t:.2f}"] = float("nan")
+        skipped_val_template[f"val/boundary_precision@{t:.2f}"] = float("nan")
+        skipped_val_template[f"val/boundary_recall@{t:.2f}"] = float("nan")
 
     use_scaler = plan.device == "cuda" and plan.amp_enabled and plan.amp_dtype == "float16"
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
@@ -301,12 +409,16 @@ def run_training(
             logger=logger,
         )
 
-        val_metrics = validate_one_epoch(
-            model=model,
-            loader=val_loader,
-            plan=plan,
-            train_cfg=train_cfg,
-        )
+        should_validate = (epoch % val_every == 0) or (epoch == epochs)
+        if should_validate:
+            val_metrics = validate_one_epoch(
+                model=model,
+                loader=val_loader,
+                plan=plan,
+                train_cfg=train_cfg,
+            )
+        else:
+            val_metrics = dict(skipped_val_template)
 
         if scheduler is not None:
             scheduler.step()
@@ -315,6 +427,8 @@ def run_training(
         row.update(train_metrics)
         row.update(val_metrics)
         row["lr"] = float(optimizer.param_groups[0]["lr"])
+        if ckpt_manager.monitor not in row:
+            row[ckpt_manager.monitor] = float("nan")
 
         history.append(row)
         append_csv_row(history_csv_path, row)
@@ -334,8 +448,11 @@ def run_training(
         logger.info(
             f"epoch={epoch}/{epochs} "
             f"train_loss={row['train/loss']:.5f} "
-            f"val_loss={row['val/loss']:.5f} "
-            f"val_extent_iou={row['val/extent_iou']:.4f} "
+            f"val_loss={row.get('val/loss', float('nan')):.5f} "
+            f"val_extent_iou={row.get('val/extent_iou', float('nan')):.4f} "
+            f"val_boundary_f1_max={row.get('val/boundary_f1_max', float('nan')):.4f} "
+            f"@thr={row.get('val/boundary_f1_max_threshold', float('nan')):.2f} "
+            f"monitor={ckpt_info['monitor']}:{ckpt_info['monitor_value']:.5f} "
             f"best={ckpt_info['best_value']}"
         )
 

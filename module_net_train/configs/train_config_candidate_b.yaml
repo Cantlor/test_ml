@@ -1,0 +1,157 @@
+paths:
+  prep_data_root: ../prep_data
+  prep_work_root: ../output_data/module_prep_data_work
+  aoi_manifest: ../output_data/module_prep_data_work/aoi_manifest.json
+  runs_root: ../output_data/module_net_train/runs
+dataset:
+  mode: single
+  splits:
+    train: train
+    val: validation
+    test: test
+  inputs:
+    num_bands: 8
+    nodata_value: 65536
+    add_valid_channel: true
+    nodata_rule: control-band
+    control_band_1based: 1
+  targets:
+    extent:
+      ignore_value: 255
+    boundary_bwbl:
+      skeleton_value: 1
+      ignore_value: 2
+normalization:
+  type: robust_percentile
+  p_low: 2
+  p_high: 98
+  per_band: true
+  stats_split: train
+  ignore_nodata: true
+augmentations:
+  enabled: true
+  hflip: true
+  vflip: true
+  rotate90: true
+  invalid_edge_sim:
+    enabled: false
+    prob: 0.0
+    min_width_px: 12
+    max_width_px: 64
+    block_prob: 0.35
+    max_area_ratio: 0.18
+    zero_image: true
+sampling:
+  crop_size: 256
+  crop_policy:
+    attempts: 8
+    min_extent_pixels: 32
+    min_boundary_pixels: 24
+    fallback_to_best_prob: 0.8
+    near_invalid:
+      enabled: true
+      enforce_prob: 0.3
+      min_pixels: 64
+      radius_px: 2
+      diag_radius_px: 2
+model:
+  name: unet_multitask
+  in_channels: 9
+  out_heads:
+    extent: 1
+    boundary: 1
+  base_channels: 24
+  depth: 4
+  norm: instancenorm
+  dropout: 0.0
+loss:
+  weights:
+    extent: 1.0
+    boundary: 8.0
+  extent:
+    bce_weight: 1.0
+    dice_weight: 1.0
+    ignore_value: 255
+  boundary_bwbl:
+    ignore_value: 2
+    pos_weight: auto
+    focal_gamma: 1.0
+    bce_weight: 1.0
+    dice_weight: 0.25
+    dice_smooth: 1.0
+metrics:
+  extent:
+    threshold: 0.5
+    compute_iou: true
+    compute_f1: true
+  boundary:
+    thresholds:
+    - 0.7
+    - 0.65
+    - 0.6
+    - 0.55
+    - 0.5
+    - 0.45
+    - 0.4
+    - 0.35
+    - 0.3
+    - 0.25
+    - 0.2
+    - 0.15
+    dilation_px: 1
+    compute_f1: true
+train:
+  seed: 203
+  deterministic: false
+  epochs: 6
+  optimizer:
+    name: adamw
+    lr: 0.0007
+    weight_decay: 0.0001
+  scheduler:
+    name: cosine
+    warmup_epochs: 2
+    min_lr: 5.0e-06
+  grad_clip_norm: 1.0
+  batch:
+    autotune: true
+    batch_size: 4
+    grad_accum_steps: 1
+  log_every_n_steps: 20
+  val_every_epochs: 1
+  checkpoint:
+    save_last: true
+    save_best: true
+    monitor: val/boundary_f1_max
+    mode: max
+inference:
+  enabled: false
+  aoi:
+    dataset_key: first_raster
+    aoi_manifest: ../output_data/module_prep_data_work/aoi_manifest.json
+  tiling:
+    window_size: 512
+    stride: 384
+    batch_size: auto
+    blend: gaussian
+    gaussian_sigma: 0.3
+    gaussian_min_weight: 0.05
+    invalid_edge_guard:
+      enabled: false
+      radius_px: 2
+      extent_scale: 0.9
+      boundary_scale: 0.75
+  outputs:
+    extent_prob_name: extent_prob.tif
+    boundary_prob_name: boundary_prob.tif
+    dtype: float32
+    compress: deflate
+    tiled: true
+    bigtiff: if_needed
+multi_dataset:
+  datasets:
+  - first_raster
+  - second_raster
+  sampling_weights:
+    first_raster: 1.0
+    second_raster: 1.0
