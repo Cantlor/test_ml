@@ -52,8 +52,9 @@ augmentations:
   vflip: true
   rotate90: true
   invalid_edge_sim:
-    # Редкая train-only симуляция invalid-краёв для устойчивости около AOI/NoData границ.
-    enabled: true
+    # Winner default (robust_b-style): synthetic invalid-edge оставляем как опцию,
+    # но по умолчанию выключаем из-за худшего practical tradeoff у valid/NoData границ.
+    enabled: false
     prob: 0.12
     min_width_px: 12
     max_width_px: 64
@@ -74,7 +75,7 @@ sampling:
     # Если квоты не выполнены, чаще берём best-effort crop, но оставляем долю случайных.
     fallback_to_best_prob: 0.80
     near_invalid:
-      # Мягкий bias: часть train-crop'ов целимся в valid/invalid transition зоны.
+      # Winner default (robust_b-style): мягкий near-invalid crop bias включён.
       enabled: true
       enforce_prob: 0.30
       min_pixels: 64
@@ -181,7 +182,7 @@ inference:
     # Если нужно — можно сделать меньше (window 384 / stride 256)
     batch_size: auto
 
-    # Center-weighted blending заметно уменьшает tile seams.
+    # Принятый inference baseline (anti-seam): gaussian center-weighted blending.
     blend: gaussian   # mean | gaussian
     gaussian_sigma: 0.30
     gaussian_min_weight: 0.05

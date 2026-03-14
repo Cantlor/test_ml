@@ -50,6 +50,18 @@ prep_data/<split>/
 - Опционально добавляется `valid` как дополнительный входной канал (`add_valid_channel: true`), то есть модель получает 9 каналов.
 - Статистика нормализации сохраняется в `band_stats.npz` и переиспользуется в инференсе/оценке.
 
+## Train-side robust options
+
+- Принятый train-side winner: **robust_b-style settings**.
+- `sampling.crop_policy.near_invalid.*` — мягкий bias части train-crop'ов к зонам `valid/invalid` перехода.
+- По умолчанию `sampling.crop_policy.near_invalid.enabled: true`.
+- `augmentations.invalid_edge_sim.*` — опциональная synthetic симуляция invalid-краёв (по умолчанию выключена).
+- По умолчанию `augmentations.invalid_edge_sim.enabled: false` (блок остаётся доступной опцией).
+- В `history.csv` логируются:
+  - `train/near_invalid_ratio`
+  - `train/synthetic_invalid_applied_rate`
+  - `train/valid_ratio`
+
 ## Обучение
 
 В `02_train.py` выполняется пайплайн:
@@ -82,6 +94,8 @@ prep_data/<split>/
 - `blend: gaussian`
 - `gaussian_sigma: 0.30`
 - `gaussian_min_weight: 0.05`
+
+Inference anti-seam fix считается принятым baseline и сохраняется без изменений.
 
 Опциональный guardrail для шума около `valid/NoData` границы:
 - `inference.tiling.invalid_edge_guard.enabled`
