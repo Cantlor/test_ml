@@ -17,6 +17,7 @@ from net_train.config import load_train_config
 from net_train.data.index import build_index
 from net_train.utils.io import write_json
 from net_train.utils.logging import setup_logger
+from net_train.utils.progress import iter_progress, progress_enabled
 
 
 def _meta_stats(values: List[float]) -> Dict[str, float | None]:
@@ -68,6 +69,7 @@ def main() -> int:
 
     logger = setup_logger("check_prep_data", level=args.log_level)
     console = Console()
+    show_progress = progress_enabled(True)
 
     cfg = load_train_config(args.config)
     prep_data_root = cfg.paths.get("prep_data_root")
@@ -94,7 +96,7 @@ def main() -> int:
     logger.info(f"Config: {cfg.config_path}")
     logger.info(f"prep_data_root: {prep_data_root}")
 
-    index = build_index(prep_data_root=prep_data_root, splits=splits)
+    index = build_index(prep_data_root=prep_data_root, splits=splits, show_progress=show_progress)
 
     report: Dict[str, object] = {
         "config": str(cfg.config_path),
@@ -107,7 +109,15 @@ def main() -> int:
 
     total_samples = 0
 
-    for alias, res in index.items():
+    split_iter = iter_progress(
+        list(index.items()),
+        total=len(index),
+        desc="check-prep",
+        unit="split",
+        enabled=show_progress,
+        leave=False,
+    )
+    for alias, res in split_iter:
         records = res.records
         total_samples += len(records)
 
@@ -126,7 +136,15 @@ def main() -> int:
             datasets[r.dataset] = datasets.get(r.dataset, 0) + 1
 
         image_checks = []
-        for r in records[: min(8, len(records))]:
+        img_candidates = records[: min(8, len(records))]
+        for r in iter_progress(
+            img_candidates,
+            total=len(img_candidates),
+            desc=f"{alias}:img-check",
+            unit="file",
+            enabled=show_progress,
+            leave=False,
+        ):
             ch = _check_img_shape(r.img_path, expected_bands)
             image_checks.append(ch)
             if not ch["ok"]:
@@ -139,7 +157,14 @@ def main() -> int:
         valid_allowed = {0, 1}
         mask_checks = []
         mask_candidates = records[: min(args.max_mask_checks, len(records))]
-        for r in mask_candidates:
+        for r in iter_progress(
+            mask_candidates,
+            total=len(mask_candidates),
+            desc=f"{alias}:mask-check",
+            unit="file",
+            enabled=show_progress,
+            leave=False,
+        ):
             e_chk = _check_mask_values(r.extent_path, extent_allowed)
             b_chk = _check_mask_values(r.boundary_bwbl_path, bwbl_allowed)
             v_chk = _check_mask_values(r.valid_path, valid_allowed)

@@ -51,6 +51,40 @@ def window_bounds(ds: rasterio.DatasetReader, win: Window) -> Tuple[float, float
     return float(b[0]), float(b[1]), float(b[2]), float(b[3])
 
 
+def boundary_raw_from_extent_gradient(extent: np.ndarray) -> np.ndarray:
+    k = np.ones((3, 3), np.uint8)
+    grad = cv2.morphologyEx(extent, cv2.MORPH_GRADIENT, k)
+    return (grad > 0).astype(np.uint8)
+
+
+def boundary_raw_from_linework(
+    shapes: list[tuple[object, int]],
+    out_shape: tuple[int, int],
+    transform,
+) -> np.ndarray:
+    line_shapes: list[tuple[object, int]] = []
+    for geom, _ in shapes:
+        if geom is None or geom.is_empty:
+            continue
+        bnd = geom.boundary
+        if bnd is None or bnd.is_empty:
+            continue
+        line_shapes.append((bnd, 1))
+
+    if not line_shapes:
+        return np.zeros(out_shape, dtype=np.uint8)
+
+    line_mask = rasterize(
+        shapes=line_shapes,
+        out_shape=out_shape,
+        transform=transform,
+        fill=0,
+        dtype=np.uint8,
+        all_touched=True,
+    )
+    return (line_mask > 0).astype(np.uint8)
+
+
 def extent_and_boundaries_for_window(
     ds: rasterio.DatasetReader,
     gdf: gpd.GeoDataFrame,
@@ -107,9 +141,15 @@ def extent_and_boundaries_for_window(
         all_touched=False,
     )
 
-    k = np.ones((3, 3), np.uint8)
-    grad = cv2.morphologyEx(extent, cv2.MORPH_GRADIENT, k)
-    boundary_raw = (grad > 0).astype(np.uint8)
+    # Primary boundary target: rasterized polygon linework (faithful to GT boundaries,
+    # including shared internal borders). Extent-gradient stays as defensive fallback.
+    boundary_raw = boundary_raw_from_linework(
+        shapes=shapes,
+        out_shape=(h, w),
+        transform=patch_transform,
+    )
+    if not boundary_raw.any() and extent.any():
+        boundary_raw = boundary_raw_from_extent_gradient(extent)
 
     if ignore_enabled and ignore_apply_to_extent and ignore_radius_px > 0:
         k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ignore_radius_px + 1, 2 * ignore_radius_px + 1))

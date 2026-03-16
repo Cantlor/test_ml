@@ -18,6 +18,7 @@ from net_train.models import build_model
 from net_train.train import load_checkpoint, validate_one_epoch
 from net_train.utils.io import write_json
 from net_train.utils.logging import setup_logger
+from net_train.utils.progress import progress_enabled
 from net_train.utils.seed import make_torch_generator, seed_dataloader_worker
 
 
@@ -52,6 +53,7 @@ def main() -> int:
 
     console = Console()
     logger = setup_logger("eval", level=args.log_level)
+    show_progress = progress_enabled(True)
 
     run_dir = Path(args.run_dir).resolve()
     train_config_path, used_run_config = resolve_run_train_config_path(args.config, run_dir)
@@ -108,7 +110,11 @@ def main() -> int:
         "test": str(splits_cfg.get("test", "test")),
     }
 
-    index = build_index(prep_data_root=train_cfg.paths["prep_data_root"], splits=splits)
+    index = build_index(
+        prep_data_root=train_cfg.paths["prep_data_root"],
+        splits=splits,
+        show_progress=show_progress,
+    )
     if index["test"].missing_files:
         raise RuntimeError("test split has missing files, run 01_check_prep_data.py first")
     if not index["test"].records:
@@ -145,6 +151,7 @@ def main() -> int:
         loader=test_loader,
         plan=plan,
         train_cfg=train_cfg.raw,
+        show_progress=show_progress,
     )
 
     out = {

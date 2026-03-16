@@ -18,6 +18,7 @@ from .labels import (
 )
 from .manifest import build_dataset_summary, build_patch_meta
 from .nodata import valid_mask_from_chip, valid_ratio_from_valid_mask
+from ..progress import bar_progress
 from .sampling import (
     build_field_ids,
     build_negative_distance_checker,
@@ -76,6 +77,7 @@ class PatchConfig:
     apply_nodata_ignore_policy: bool = True
     nodata_ignore_extent_value: int = 255
     nodata_ignore_bwbl_value: int = 2
+    show_progress: bool = True
 
     seed: int = 123
     target_patches: int = 800
@@ -287,49 +289,80 @@ def make_patches_for_dataset(
             return True
 
         patch_idx = 0
+        show_progress = bool(cfg.show_progress)
         center_attempts = 0
         max_center_attempts = max(center_target * 50, 2000)
-        while written_center < center_target and center_attempts < max_center_attempts:
-            center_attempts += 1
-            fi = int(rng.integers(0, nfeat))
-            poly = gdf.geometry.iloc[int(fi)]
-            p = sample_point_in_poly(poly, rng=rng)
-            if p is None:
-                rejects["other"] += 1
-                continue
-            row, col = ds.index(p.x, p.y)
-            off = safe_window_centered(col, row, patch_w, patch_h, ds.width, ds.height)
-            if off is None:
-                rejects["oob"] += 1
-                continue
-            xoff, yoff = off
-            win = Window(xoff, yoff, patch_w, patch_h)
-            pid = f"{ds_name}_{patch_idx:06d}"
-            patch_idx += 1
-            _ = try_write_patch(pid, win, "center", int(fi))
+        with bar_progress(
+            total=int(center_target),
+            desc=f"{ds_name}:center",
+            unit="patch",
+            enabled=show_progress,
+            leave=False,
+        ) as center_bar:
+            while written_center < center_target and center_attempts < max_center_attempts:
+                center_attempts += 1
+                fi = int(rng.integers(0, nfeat))
+                poly = gdf.geometry.iloc[int(fi)]
+                p = sample_point_in_poly(poly, rng=rng)
+                if p is None:
+                    rejects["other"] += 1
+                    continue
+                row, col = ds.index(p.x, p.y)
+                off = safe_window_centered(col, row, patch_w, patch_h, ds.width, ds.height)
+                if off is None:
+                    rejects["oob"] += 1
+                    continue
+                xoff, yoff = off
+                win = Window(xoff, yoff, patch_w, patch_h)
+                pid = f"{ds_name}_{patch_idx:06d}"
+                patch_idx += 1
+                if try_write_patch(pid, win, "center", int(fi)):
+                    center_bar.update(1)
+                if center_attempts % 200 == 0:
+                    center_bar.set_postfix(
+                        attempts=center_attempts,
+                        written=written_center,
+                        rej=rejects["valid"] + rejects["mask"] + rejects["oob"] + rejects["other"],
+                        refresh=False,
+                    )
 
         jitter_m = max(1.0, 0.10 * patch_w * pix_m)
         boundary_attempts = 0
         max_boundary_attempts = max(boundary_target * 50, 2000)
-        while written_boundary < boundary_target and boundary_attempts < max_boundary_attempts:
-            boundary_attempts += 1
-            fi = int(rng.integers(0, nfeat))
-            poly = gdf.geometry.iloc[int(fi)]
-            p0 = sample_point_on_boundary(poly, rng=rng)
-            if p0 is None:
-                rejects["other"] += 1
-                continue
-            p = jitter_point(p0, rng=rng, jitter_m=jitter_m)
-            row, col = ds.index(p.x, p.y)
-            off = safe_window_centered(col, row, patch_w, patch_h, ds.width, ds.height)
-            if off is None:
-                rejects["oob"] += 1
-                continue
-            xoff, yoff = off
-            win = Window(xoff, yoff, patch_w, patch_h)
-            pid = f"{ds_name}_{patch_idx:06d}"
-            patch_idx += 1
-            _ = try_write_patch(pid, win, "boundary", int(fi))
+        with bar_progress(
+            total=int(boundary_target),
+            desc=f"{ds_name}:boundary",
+            unit="patch",
+            enabled=show_progress,
+            leave=False,
+        ) as boundary_bar:
+            while written_boundary < boundary_target and boundary_attempts < max_boundary_attempts:
+                boundary_attempts += 1
+                fi = int(rng.integers(0, nfeat))
+                poly = gdf.geometry.iloc[int(fi)]
+                p0 = sample_point_on_boundary(poly, rng=rng)
+                if p0 is None:
+                    rejects["other"] += 1
+                    continue
+                p = jitter_point(p0, rng=rng, jitter_m=jitter_m)
+                row, col = ds.index(p.x, p.y)
+                off = safe_window_centered(col, row, patch_w, patch_h, ds.width, ds.height)
+                if off is None:
+                    rejects["oob"] += 1
+                    continue
+                xoff, yoff = off
+                win = Window(xoff, yoff, patch_w, patch_h)
+                pid = f"{ds_name}_{patch_idx:06d}"
+                patch_idx += 1
+                if try_write_patch(pid, win, "boundary", int(fi)):
+                    boundary_bar.update(1)
+                if boundary_attempts % 200 == 0:
+                    boundary_bar.set_postfix(
+                        attempts=boundary_attempts,
+                        written=written_boundary,
+                        rej=rejects["valid"] + rejects["mask"] + rejects["oob"] + rejects["other"],
+                        refresh=False,
+                    )
 
         min_dist = float(cfg.negatives_min_dist_m)
         is_too_close = build_negative_distance_checker(ds, union_geom, min_dist_m=min_dist)
@@ -341,33 +374,46 @@ def make_patches_for_dataset(
         row_min = int(patch_h // 2)
         row_max = int(ds.height - (patch_h - patch_h // 2))
 
-        while written_neg < neg_target and neg_attempts < max_neg_attempts:
-            neg_attempts += 1
-            col = int(rng.integers(col_min, col_max + 1))
-            row = int(rng.integers(row_min, row_max + 1))
+        with bar_progress(
+            total=int(neg_target),
+            desc=f"{ds_name}:negative",
+            unit="patch",
+            enabled=show_progress,
+            leave=False,
+        ) as neg_bar:
+            while written_neg < neg_target and neg_attempts < max_neg_attempts:
+                neg_attempts += 1
+                col = int(rng.integers(col_min, col_max + 1))
+                row = int(rng.integers(row_min, row_max + 1))
 
-            x, y = ds.xy(row, col)
-            p = Point(float(x), float(y))
+                x, y = ds.xy(row, col)
+                p = Point(float(x), float(y))
 
-            try:
-                if is_too_close(p):
-                    rejects["neg_dist"] += 1
+                try:
+                    if is_too_close(p):
+                        rejects["neg_dist"] += 1
+                        continue
+                except Exception:
+                    pass
+
+                off = safe_window_centered(col, row, patch_w, patch_h, ds.width, ds.height)
+                if off is None:
+                    rejects["oob"] += 1
                     continue
-            except Exception:
-                pass
+                xoff, yoff = off
+                win = Window(xoff, yoff, patch_w, patch_h)
 
-            off = safe_window_centered(col, row, patch_w, patch_h, ds.width, ds.height)
-            if off is None:
-                rejects["oob"] += 1
-                continue
-            xoff, yoff = off
-            win = Window(xoff, yoff, patch_w, patch_h)
-
-            pid = f"{ds_name}_{patch_idx:06d}"
-            patch_idx += 1
-            ok = try_write_patch(pid, win, "negative", None)
-            if not ok:
-                continue
+                pid = f"{ds_name}_{patch_idx:06d}"
+                patch_idx += 1
+                if try_write_patch(pid, win, "negative", None):
+                    neg_bar.update(1)
+                if neg_attempts % 300 == 0:
+                    neg_bar.set_postfix(
+                        attempts=neg_attempts,
+                        written=written_neg,
+                        rej=rejects["neg_dist"] + rejects["neg_mask"] + rejects["valid"] + rejects["oob"],
+                        refresh=False,
+                    )
 
         summary = build_dataset_summary(
             ds_name=ds_name,

@@ -18,6 +18,7 @@ from ..artifacts import (
 )
 from ..config import load_config
 from ..manifests import PatchesManifest, SplitManifest
+from ..progress import iter_progress
 
 
 SPLITS = ("train", "validation", "test")
@@ -49,14 +50,29 @@ def load_dataset_manifest(path: Path) -> List[dict]:
     return patches
 
 
-def collect_patches(top_manifest: PatchesManifest) -> List[PatchRec]:
+def collect_patches(top_manifest: PatchesManifest, show_progress: bool | None = None) -> List[PatchRec]:
     out: List[PatchRec] = []
-    for ds_item in top_manifest.datasets:
+    ds_iter = iter_progress(
+        top_manifest.datasets,
+        total=len(top_manifest.datasets),
+        desc="collect-manifests",
+        unit="dataset",
+        enabled=show_progress,
+    )
+    for ds_item in ds_iter:
         ds_name = ds_item.dataset
         ds_dir = Path(ds_item.output_dataset_dir).resolve()
         rows = load_dataset_manifest(Path(ds_item.dataset_manifest_path).resolve())
 
-        for p in rows:
+        row_iter = iter_progress(
+            rows,
+            total=len(rows),
+            desc=f"{ds_name}:manifest",
+            unit="patch",
+            enabled=show_progress,
+            leave=False,
+        )
+        for p in row_iter:
             patch_id = str(p["patch_id"])
             field_id = p.get("field_id", None)
             feat_index = p.get("feat_index", None)
@@ -300,6 +316,7 @@ def run(
     overwrite: bool = False,
 ) -> int:
     cfg = load_config(config_path)
+    show_progress = bool(cfg.performance.progress)
     if str(cfg.split.unit).strip().lower() != "by_field":
         raise RuntimeError(
             f"Only split.unit='by_field' is implemented in this stage. "
@@ -335,7 +352,7 @@ def run(
     console.print(f"ratios: train={train_ratio} val={val_ratio} test={test_ratio}  seed={seed}")
     console.print("NOTE: extent target is exported from extent_ig (ignore-aware extent contract).")
 
-    recs = collect_patches(top_manifest)
+    recs = collect_patches(top_manifest, show_progress=show_progress)
     console.print(f"found patches in manifests: {len(recs)}")
 
     existing_assignments = {} if overwrite else scan_existing_assignments(split_roots, meta_folder=folders["meta"])
@@ -355,7 +372,15 @@ def run(
         items = assigned_new[split_name]
         console.print(f"\n[bold]{split_name}[/bold] new_items={len(items)}")
         base = split_roots[split_name]
-        for r in items:
+        copy_iter = iter_progress(
+            items,
+            total=len(items),
+            desc=f"copy->{split_name}",
+            unit="patch",
+            enabled=show_progress,
+            leave=False,
+        )
+        for r in copy_iter:
             if copy_record(r, base, folders=folders, overwrite=overwrite):
                 copied_counts[split_name] += 1
 

@@ -14,6 +14,7 @@ from ..artifacts import (
 from ..clip_raster import clip_raster_by_vectors
 from ..config import load_config
 from ..manifests import AoiDatasetResult, AoiManifest
+from ..progress import iter_progress
 from ..utils import ensure_dir, write_json
 
 
@@ -48,9 +49,17 @@ def run(config_path: str | Path) -> int:
     mask_outside = bool(cfg.aoi_clip.mask_outside)
 
     results: List[AoiDatasetResult] = []
+    show_progress = bool(cfg.performance.progress)
 
     if not cfg.aoi_clip.enabled:
-        for ds in cfg.datasets:
+        ds_iter = iter_progress(
+            cfg.datasets,
+            total=len(cfg.datasets),
+            desc="clip-aoi",
+            unit="dataset",
+            enabled=show_progress,
+        )
+        for ds in ds_iter:
             c = check_dataset_entry(check_manifest, ds.name)
             results.append(
                 AoiDatasetResult(
@@ -80,7 +89,14 @@ def run(config_path: str | Path) -> int:
         console.print(f"aoi manifest: {mpath}")
         return 0
 
-    for ds in cfg.datasets:
+    ds_iter = iter_progress(
+        cfg.datasets,
+        total=len(cfg.datasets),
+        desc="clip-aoi",
+        unit="dataset",
+        enabled=show_progress,
+    )
+    for ds in ds_iter:
         c = check_dataset_entry(check_manifest, ds.name)
         raster_path = Path(c.raw_raster_path).resolve()
         vector_path = Path(c.raw_vector_path).resolve()

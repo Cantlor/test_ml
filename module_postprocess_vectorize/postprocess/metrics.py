@@ -11,6 +11,7 @@ from scipy import ndimage as ndi
 from shapely.geometry import shape
 
 from .geometry_clean import count_holes
+from .progress import iter_progress
 
 
 def _prepare_polygons(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -25,7 +26,7 @@ def _prepare_polygons(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return out
 
 
-def load_polygons(path: Path) -> gpd.GeoDataFrame:
+def load_polygons(path: Path, show_progress: bool | None = None) -> gpd.GeoDataFrame:
     """Load GT/pred polygons from vector file or label/mask raster."""
     ext = path.suffix.lower()
     if ext in {".gpkg", ".shp", ".geojson", ".json"}:
@@ -53,7 +54,15 @@ def load_polygons(path: Path) -> gpd.GeoDataFrame:
                 labels = arr_int
 
         records = []
-        for geom_json, value in shapes(labels.astype(np.int32), mask=labels > 0, transform=transform):
+        shape_iter = iter_progress(
+            shapes(labels.astype(np.int32), mask=labels > 0, transform=transform),
+            total=None,
+            desc=f"load-polygons:{path.name}",
+            unit="shape",
+            enabled=show_progress,
+            leave=False,
+        )
+        for geom_json, value in shape_iter:
             lbl = int(value)
             if lbl <= 0:
                 continue
@@ -77,6 +86,7 @@ def _pairwise_iou_and_merges(
     pred: gpd.GeoDataFrame,
     gt: gpd.GeoDataFrame,
     merge_overlap_ratio: float,
+    show_progress: bool | None = None,
 ) -> tuple[List[Tuple[float, int, int, float]], int]:
     """Return candidate (iou,pred_idx,gt_idx,intersection_area) pairs and merge penalty count."""
     pairs: List[Tuple[float, int, int, float]] = []
@@ -87,7 +97,15 @@ def _pairwise_iou_and_merges(
 
     gt_sindex = gt.sindex
 
-    for p_idx, p_geom in enumerate(pred.geometry):
+    pred_iter = iter_progress(
+        enumerate(pred.geometry),
+        total=int(len(pred)),
+        desc="pairwise-iou",
+        unit="pred",
+        enabled=show_progress,
+        leave=False,
+    )
+    for p_idx, p_geom in pred_iter:
         cand = list(gt_sindex.intersection(p_geom.bounds))
         overlap_gt = 0
 
@@ -124,6 +142,7 @@ def evaluate_polygons(
     iou_threshold: float = 0.5,
     merge_overlap_ratio: float = 0.2,
     area_weighted: bool = True,
+    show_progress: bool | None = None,
 ) -> Dict[str, float | int]:
     """Object-level evaluation with greedy IoU matching."""
     if gt_gdf.crs is None or pred_gdf.crs is None:
@@ -197,7 +216,12 @@ def evaluate_polygons(
             "area_f1": 0.0,
         }
 
-    pairs, merge_penalty = _pairwise_iou_and_merges(pred=pred, gt=gt, merge_overlap_ratio=merge_overlap_ratio)
+    pairs, merge_penalty = _pairwise_iou_and_merges(
+        pred=pred,
+        gt=gt,
+        merge_overlap_ratio=merge_overlap_ratio,
+        show_progress=show_progress,
+    )
     pairs.sort(key=lambda x: x[0], reverse=True)
 
     matched_pred = set()

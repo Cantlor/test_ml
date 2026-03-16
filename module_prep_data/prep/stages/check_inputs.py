@@ -12,6 +12,7 @@ from rich.logging import RichHandler
 from ..artifacts import PREPARED_VECTOR_LAYER, check_inputs_manifest_path, get_work_dir
 from ..config import load_config
 from ..manifests import CheckInputsDatasetResult, CheckInputsManifest
+from ..progress import iter_progress
 from ..qa_raster import estimate_valid_ratio, read_raster_info
 from ..qa_vector import check_and_prepare_vector
 from ..utils import ensure_dir, find_single_by_globs, write_json
@@ -109,7 +110,15 @@ def run(config_path: str | Path) -> int:
         f"control_band_1based={cfg.nodata_policy.control_band_1based}"
     )
 
-    for i, ds in enumerate(cfg.datasets):
+    show_progress = bool(cfg.performance.progress)
+    ds_iter = iter_progress(
+        cfg.datasets,
+        total=len(cfg.datasets),
+        desc="check-inputs",
+        unit="dataset",
+        enabled=show_progress,
+    )
+    for i, ds in enumerate(ds_iter):
         logger.info(f"\n[dataset] {ds.name}  root={ds.root}")
         ds_item: Dict[str, Any] = {"name": ds.name, "root": str(ds.root), "ok": True, "errors": [], "warnings": []}
 

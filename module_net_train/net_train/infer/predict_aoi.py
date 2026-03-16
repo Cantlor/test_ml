@@ -13,6 +13,7 @@ from net_train.data.stats import NormalizationStats, normalize_image
 from net_train.hardware import RuntimePlan, amp_dtype_from_plan
 from net_train.infer.tiling import TileWindow, blend_weights, generate_windows
 from net_train.utils.io import read_json
+from net_train.utils.progress import bar_progress
 
 
 def _resolve_from_manifest_obj(obj: object, dataset_key: str) -> Path | None:
@@ -218,6 +219,7 @@ def predict_aoi_raster(
     invalid_edge_guard_px: int = 0,
     invalid_edge_extent_scale: float = 1.0,
     invalid_edge_boundary_scale: float = 1.0,
+    show_progress: bool | None = None,
 ) -> Dict[str, object]:
     window_size = int(window_size)
     stride = int(stride)
@@ -253,88 +255,96 @@ def predict_aoi_raster(
 
         device = torch.device(plan.device)
 
-        for group in _batch_iter(tiles, batch_size):
-            chips = []
-            valid_masks = []
-            valid_hw = []
-            for tile in group:
-                chip, valid_mask, hw = _prepare_chip(
-                    ds=ds,
-                    tile=tile,
-                    model_window_size=window_size,
-                    norm_stats=norm_stats,
-                    num_bands=num_bands,
-                    add_valid_channel=add_valid_channel,
-                    nodata_value=nodata_value,
-                    nodata_rule=nodata_rule,
-                    control_band_1based=control_band_1based,
-                )
-                chips.append(chip)
-                valid_masks.append(valid_mask)
-                valid_hw.append(hw)
-
-            x = torch.from_numpy(np.stack(chips, axis=0)).to(device=device, dtype=torch.float32)
-
-            if plan.device == "cuda" and plan.amp_enabled:
-                with torch.autocast(device_type="cuda", dtype=amp_dtype_from_plan(plan)):
-                    out = model(x)
-            else:
-                out = model(x)
-
-            # numpy does not support torch bfloat16 directly; cast to float32 first.
-            extent_prob = (
-                torch.sigmoid(out["extent_logits"])
-                .squeeze(1)
-                .detach()
-                .float()
-                .cpu()
-                .numpy()
-            )
-            boundary_prob = (
-                torch.sigmoid(out["boundary_logits"])
-                .squeeze(1)
-                .detach()
-                .float()
-                .cpu()
-                .numpy()
-            )
-
-            for i, tile in enumerate(group):
-                h, w = valid_hw[i]
-                e = extent_prob[i, :h, :w]
-                b = boundary_prob[i, :h, :w]
-                valid = valid_masks[i][:h, :w]
-
-                # NoData suppression guard-rail
-                e[valid == 0] = 0.0
-                b[valid == 0] = 0.0
-
-                if guard_px > 0 and (guard_extent_scale < 1.0 or guard_boundary_scale < 1.0):
-                    edge_band = _invalid_edge_band(valid, radius_px=guard_px)
-                    if np.any(edge_band):
-                        guard_applied_pixels += int(edge_band.sum())
-                        if guard_extent_scale < 1.0:
-                            e[edge_band] *= guard_extent_scale
-                        if guard_boundary_scale < 1.0:
-                            b[edge_band] *= guard_boundary_scale
-
-                ww = weight_cache.get((h, w))
-                if ww is None:
-                    ww = blend_weights(
-                        h=h,
-                        w=w,
-                        mode=blend,
-                        gaussian_sigma=gaussian_sigma,
-                        gaussian_min_weight=gaussian_min_weight,
+        with bar_progress(
+            total=len(tiles),
+            desc="infer-tiles",
+            unit="tile",
+            enabled=show_progress,
+            leave=False,
+        ) as tile_bar:
+            for group in _batch_iter(tiles, batch_size):
+                chips = []
+                valid_masks = []
+                valid_hw = []
+                for tile in group:
+                    chip, valid_mask, hw = _prepare_chip(
+                        ds=ds,
+                        tile=tile,
+                        model_window_size=window_size,
+                        norm_stats=norm_stats,
+                        num_bands=num_bands,
+                        add_valid_channel=add_valid_channel,
+                        nodata_value=nodata_value,
+                        nodata_rule=nodata_rule,
+                        control_band_1based=control_band_1based,
                     )
-                    weight_cache[(h, w)] = ww
+                    chips.append(chip)
+                    valid_masks.append(valid_mask)
+                    valid_hw.append(hw)
 
-                y0, y1 = tile.y, tile.y + h
-                x0, x1 = tile.x, tile.x + w
+                x = torch.from_numpy(np.stack(chips, axis=0)).to(device=device, dtype=torch.float32)
 
-                acc_extent[y0:y1, x0:x1] += e * ww
-                acc_boundary[y0:y1, x0:x1] += b * ww
-                acc_weight[y0:y1, x0:x1] += ww
+                if plan.device == "cuda" and plan.amp_enabled:
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype_from_plan(plan)):
+                        out = model(x)
+                else:
+                    out = model(x)
+
+                # numpy does not support torch bfloat16 directly; cast to float32 first.
+                extent_prob = (
+                    torch.sigmoid(out["extent_logits"])
+                    .squeeze(1)
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+                boundary_prob = (
+                    torch.sigmoid(out["boundary_logits"])
+                    .squeeze(1)
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+
+                for i, tile in enumerate(group):
+                    h, w = valid_hw[i]
+                    e = extent_prob[i, :h, :w]
+                    b = boundary_prob[i, :h, :w]
+                    valid = valid_masks[i][:h, :w]
+
+                    # NoData suppression guard-rail
+                    e[valid == 0] = 0.0
+                    b[valid == 0] = 0.0
+
+                    if guard_px > 0 and (guard_extent_scale < 1.0 or guard_boundary_scale < 1.0):
+                        edge_band = _invalid_edge_band(valid, radius_px=guard_px)
+                        if np.any(edge_band):
+                            guard_applied_pixels += int(edge_band.sum())
+                            if guard_extent_scale < 1.0:
+                                e[edge_band] *= guard_extent_scale
+                            if guard_boundary_scale < 1.0:
+                                b[edge_band] *= guard_boundary_scale
+
+                    ww = weight_cache.get((h, w))
+                    if ww is None:
+                        ww = blend_weights(
+                            h=h,
+                            w=w,
+                            mode=blend,
+                            gaussian_sigma=gaussian_sigma,
+                            gaussian_min_weight=gaussian_min_weight,
+                        )
+                        weight_cache[(h, w)] = ww
+
+                    y0, y1 = tile.y, tile.y + h
+                    x0, x1 = tile.x, tile.x + w
+
+                    acc_extent[y0:y1, x0:x1] += e * ww
+                    acc_boundary[y0:y1, x0:x1] += b * ww
+                    acc_weight[y0:y1, x0:x1] += ww
+                tile_bar.update(len(group))
 
         denom = np.clip(acc_weight, 1e-6, None)
         extent_final = acc_extent / denom

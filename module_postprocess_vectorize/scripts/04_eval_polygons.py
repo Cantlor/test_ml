@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from module_postprocess_vectorize.postprocess.io import write_json
 from module_postprocess_vectorize.postprocess.metrics import evaluate_polygons, load_polygons
+from module_postprocess_vectorize.postprocess.progress import progress_enabled
 
 
 def setup_logger(level: str) -> logging.Logger:
@@ -38,14 +39,16 @@ def main() -> int:
 
     logger = setup_logger(args.log_level)
     console = Console()
+    show_progress = progress_enabled(True)
 
-    gt_gdf = load_polygons(Path(args.gt))
-    pred_gdf = load_polygons(Path(args.pred))
+    gt_gdf = load_polygons(Path(args.gt), show_progress=show_progress)
+    pred_gdf = load_polygons(Path(args.pred), show_progress=show_progress)
 
     metrics = evaluate_polygons(
         gt_gdf=gt_gdf,
         pred_gdf=pred_gdf,
         iou_threshold=float(args.iou_threshold),
+        show_progress=show_progress,
     )
 
     logger.info("Metrics: %s", metrics)

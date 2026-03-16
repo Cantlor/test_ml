@@ -7,7 +7,6 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.logging import RichHandler
-from tqdm import tqdm
 
 MODULE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = MODULE_ROOT.parent
@@ -17,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 from module_postprocess_vectorize.postprocess.inputs import discover_prediction_samples
 from module_postprocess_vectorize.postprocess.io import ensure_dir, write_json
 from module_postprocess_vectorize.postprocess.pipeline import load_config, run_postprocess_pipeline
+from module_postprocess_vectorize.postprocess.progress import iter_progress, progress_enabled
 
 
 def setup_logger(level: str) -> logging.Logger:
@@ -49,6 +49,7 @@ def main() -> int:
 
     logger = setup_logger(args.log_level)
     console = Console()
+    show_progress = progress_enabled(True)
 
     run_dir = Path(args.run_dir).resolve()
     pred_root = Path(args.pred_root).resolve() if args.pred_root else (run_dir / "pred")
@@ -84,7 +85,14 @@ def main() -> int:
         "samples": [],
     }
 
-    for sample in tqdm(samples, desc="postprocess-run", unit="sample"):
+    sample_iter = iter_progress(
+        samples,
+        total=len(samples),
+        desc="postprocess-run",
+        unit="sample",
+        enabled=show_progress,
+    )
+    for sample in sample_iter:
         out_dir = output_root / sample.sample_id
         try:
             res = run_postprocess_pipeline(
@@ -100,6 +108,7 @@ def main() -> int:
                 config=cfg,
                 save_outputs=True,
                 logger=logger,
+                show_progress=show_progress,
             )
             summary["samples"].append(
                 {

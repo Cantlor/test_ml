@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import geopandas as gpd
-from tqdm import tqdm
 
 from .io import deep_update, to_serializable, write_json, write_yaml
 from .inputs import PredictionSample, discover_prediction_samples
 from .metrics import aggregate_metrics, evaluate_polygons, load_polygons, ranking_key
 from .pipeline import run_postprocess_pipeline
+from .progress import iter_progress
 
 
 def _candidate_gt_paths(gt_root: Path, sample_id: str, mode: str) -> List[Path]:
@@ -195,14 +195,29 @@ def _evaluate_trials(
     desc: str,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for local_idx, params in enumerate(tqdm(trials, desc=desc, unit="trial"), start=1):
+    trial_iter = iter_progress(
+        trials,
+        total=len(trials),
+        desc=desc,
+        unit="trial",
+        enabled=True,
+    )
+    for local_idx, params in enumerate(trial_iter, start=1):
         trial_idx = int(trial_offset + local_idx)
         trial_cfg = deep_update(dict(base_config), dict(params))
         trial_cfg["save_intermediates"] = False
         trial_cfg["export_shp"] = False
 
         sample_metrics = []
-        for s in samples:
+        sample_iter = iter_progress(
+            samples,
+            total=len(samples),
+            desc=f"{desc}:samples",
+            unit="sample",
+            enabled=False,
+            leave=False,
+        )
+        for s in sample_iter:
             res = run_postprocess_pipeline(
                 extent_prob_path=s.extent_prob_path,
                 boundary_prob_path=s.boundary_prob_path,
@@ -216,10 +231,16 @@ def _evaluate_trials(
                 config=trial_cfg,
                 save_outputs=False,
                 logger=logger,
+                show_progress=False,
             )
             pred_gdf = res["fields_pred"]
             gt_gdf = gt_map[s.sample_id]
-            m = evaluate_polygons(gt_gdf=gt_gdf, pred_gdf=pred_gdf, iou_threshold=iou_thr)
+            m = evaluate_polygons(
+                gt_gdf=gt_gdf,
+                pred_gdf=pred_gdf,
+                iou_threshold=iou_thr,
+                show_progress=False,
+            )
             m["sample_id"] = s.sample_id
             sample_metrics.append(m)
 
@@ -259,9 +280,17 @@ def run_grid_search(
 
     gt_map: Dict[str, gpd.GeoDataFrame] = {}
     gt_path_map: Dict[str, str] = {}
-    for s in samples:
+    sample_iter = iter_progress(
+        samples,
+        total=len(samples),
+        desc="resolve-gt",
+        unit="sample",
+        enabled=True,
+        leave=False,
+    )
+    for s in sample_iter:
         gt_path = resolve_gt_path(s.sample_id, gt_root=gt_root, gt_mode=gt_mode)
-        gt_map[s.sample_id] = load_polygons(gt_path)
+        gt_map[s.sample_id] = load_polygons(gt_path, show_progress=False)
         gt_path_map[s.sample_id] = str(gt_path)
 
     full_grid = build_grid(base_config)

@@ -1,22 +1,34 @@
 # uzcosmos `my_project`
 
-Репозиторий состоит из двух основных модулей:
+Документ отражает фактическое состояние репозитория на **2026-03-16**.
 
-1. `module_prep_data` — подготовка данных (AOI-клиппинг, QA, генерация патчей, split).
-2. `module_net_train` — обучение multitask U-Net, инференс по AOI, оценка на test.
+## 1. Текущий статус проекта
 
-Ниже — подробный технический разбор того, что делает каждый блок, как связаны этапы пайплайна и какие параметры менять, чтобы влиять на результат обучения нейросети (без изменения исходных входных данных).
+Проект состоит из 3 рабочих модулей:
 
----
+1. `module_prep_data` — подготовка AOI/patches/labels/split.
+2. `module_net_train` — train + infer + eval multitask U-Net.
+3. `module_postprocess_vectorize` — постобработка probability raster в полигоны.
 
-## 1) End-to-End пайплайн
+Текущее рабочее состояние:
+- `prep_data` пересобран и валидирован (947 patch).
+- train/infer/eval выполнены в `output_data/module_net_train/runs/20260316_103300`.
+- postprocess выполнен для `first_raster` и сохранил manifest/runtime диагностику.
+
+Terminal UX update:
+- Во всех 3 модулях добавлены progress-бары для длительных стадий (datasets/patches/batches/tiles/samples/object-loops).
+- Единый helper: `project_progress.py`.
+- Принудительное отключение: `DISABLE_PROGRESS=1`.
+- Принудительное включение: `FORCE_PROGRESS=1`.
+
+## 2. Архитектура пайплайна
 
 ```text
-initial_data/
-  └── <dataset>/{raster.tif, vector.shp/gpkg}
+initial_data/<dataset>/
+  clipped.tif + sardoba.shp
         |
         v
-module_prep_data
+module_prep_data/scripts/
   01_check_inputs.py
   02_clip_to_aoi.py
   03_make_patches.py
@@ -24,10 +36,10 @@ module_prep_data
         |
         v
 prep_data/{train,validation,test}/
-  img/, extent/, boundary_bwbl/, valid/, meta/
+  img, valid, extent, boundary_bwbl, meta
         |
         v
-module_net_train
+module_net_train/scripts/
   01_check_prep_data.py
   02_train.py
   03_predict_aoi.py
@@ -35,397 +47,159 @@ module_net_train
         |
         v
 output_data/module_net_train/runs/<run_id>/
-  checkpoints/, metrics/, pred/, logs/, band_stats.npz
+  metrics/, pred/, postprocess/, checkpoints/
+        |
+        v
+module_postprocess_vectorize/scripts/
+  02_postprocess_single.py
+  03_postprocess_run.py
+  04_eval_polygons.py
 ```
 
----
+## 3. Подтвержденные forensic-факты (accepted technical truths)
 
-## 2) Структура репозитория
+1. **Root cause internal boundaries был в label semantics, не в ArcGIS styling.**
+   - Подтверждено кодом `module_prep_data/prep/patching/labels.py` и тестом `test_boundary_raw_keeps_shared_internal_boundaries`.
+2. **Prepared vector faithful, старая boundary-логика была not faithful к внутренним границам.**
+   - Сравнение old/new есть в `/tmp/independent_boundary_patch_validation/independent_validation_summary.json`.
+3. **Rebuild prep_data выполнен, post-rebuild validation есть.**
+   - `/tmp/post_rebuild_boundary_validation/post_rebuild_summary.json`.
+   - Контракты labels подтверждены: `extent ⊂ {0,1,255}`, `bwbl ⊂ {0,1,2}`, `valid ⊂ {0,1}`.
+4. **Сильное улучшение retention внутренних границ после фикса labels.**
+   - `braw_inner weighted_old=0.0200 -> weighted_new=0.9194`.
+   - `bw_any_inner weighted_old=0.1367 -> weighted_new=0.9999`.
+5. **Новый train-run после фикса labels актуален и присутствует.**
+   - Текущий run: `output_data/module_net_train/runs/20260316_103300`.
 
-Ключевые директории:
+## 4. Source of truth (артефакты)
 
-- `initial_data/` — исходные геоданные.
-- `module_prep_data/` — модуль препроцессинга.
-- `prep_data/` — готовые train/val/test патчи (вход для обучения).
-- `module_net_train/` — модуль обучения/инференса.
-- `output_data/` — артефакты этапов (рабочие промежуточные данные, run-логи, чекпоинты, предсказания).
+### Prep
+- `output_data/module_prep_data_work/check_inputs_manifest.json`
+- `output_data/module_prep_data_work/aoi_manifest.json`
+- `output_data/module_prep_data_work/patches_manifest.json`
+- `output_data/module_prep_data_work/patches_all/first_raster/manifest.json`
+- `prep_data/split_manifest.json`
+- `output_data/data_check.json`
 
-Ключевые конфиги:
+Ключевые факты:
+- `total_patches=947`, split: `train=757`, `validation=95`, `test=95`.
+- valid_ratio warning на входном raster: `0.6794 < 0.7`.
 
-- `module_prep_data/prep_config.yaml`
-- `module_net_train/configs/train_config.yaml`
-- `module_net_train/configs/hardware_config.yaml`
+### Train / Infer / Eval
+- `output_data/module_net_train/runs/20260316_103300/config_resolved.yaml`
+- `output_data/module_net_train/runs/20260316_103300/hardware.json`
+- `output_data/module_net_train/runs/20260316_103300/metrics/history.csv`
+- `output_data/module_net_train/runs/20260316_103300/metrics/eval_test.json`
+- `output_data/module_net_train/runs/20260316_103300/pred/first_raster/predict_manifest.json`
 
----
+Ключевые факты:
+- best epoch по `val/boundary_f1_max`: epoch 38, `0.475046` (`thr=0.70`).
+- test eval (`best.pt`): `extent_iou=0.9448`, `extent_f1=0.9716`, `boundary_f1_max=0.4755`.
+- near-invalid KPI остается слабым: `extent_f1_near_invalid=0.0`, `boundary_f1_max_near_invalid≈0.109`.
 
-## 3) Разбор `module_prep_data` (что делает каждый блок)
+### Postprocess
+- `output_data/module_net_train/runs/20260316_103300/postprocess/postprocess_run_summary.json`
+- `output_data/module_net_train/runs/20260316_103300/postprocess/first_raster/postprocess_manifest.json`
+- `output_data/module_net_train/runs/20260316_103300/postprocess/first_raster/params_used.json`
 
-### 3.1 Скрипты `module_prep_data/scripts`
+Ключевые факты:
+- valid mask восстановлен как `valid_source=footprint_nodata`.
+- на текущем AOI runtime pressure высокий (`estimated_pressure≈2.80`), поэтому:
+  - `gaussian_sigma_px_effective=0.0`
+  - `use_watershed=false`
+  - `clean_labels_mode=fast`
 
-1. `01_check_inputs.py`
-- Загружает `prep_config.yaml`.
-- Проверяет доступность растра/вектора по glob-шаблонам.
-- Валидирует базовые параметры растра (CRS, dtype, band_count, оценка valid_ratio).
-- Приводит вектор к CRS растра, чистит геометрии в памяти, фильтрует по площади.
-- Пишет отчёт `output_data/data_check.json`.
-- Сохраняет подготовленный вектор `output_data/module_prep_data_work/<dataset>_vector_prepared.gpkg`.
+### Forensic/validation во временных папках
+- `/tmp/independent_boundary_patch_validation/independent_validation_summary.json`
+- `/tmp/independent_boundary_patch_validation/independent_validation_per_patch.json`
+- `/tmp/post_rebuild_boundary_validation/post_rebuild_summary.json`
+- `/tmp/post_rebuild_boundary_validation/post_rebuild_per_patch.json`
+- `/tmp/pre_rebuild_quick_stats_1773656501382623004.json`
+- `/tmp/prep_rebuild_snapshot_20260316_152141/*`
 
-2. `02_clip_to_aoi.py`
-- Опционально клиппит исходный raster по AOI из вектора (`bbox` или `mask` режим).
-- Пишет AOI-растры в `output_data/module_prep_data_work/aoi_rasters/`.
-- Создаёт манифесты AOI для downstream этапов.
+## 5. Data contract между модулями
 
-3. `03_make_patches.py`
-- Берёт AOI raster (если есть) + prepared vector.
-- Генерирует патчи `img`, `extent`, `extent_ig`, `boundary_raw`, `boundary_bwbl`, `valid`, `meta`.
-- Применяет политику NoData -> ignore на таргетах.
-- Пишет всё в `output_data/module_prep_data_work/patches_all/<dataset>/...`.
-
-4. `04_split_dataset.py`
-- Читает `patches_all/*/manifest.json`.
-- Делит записи на `train/validation/test` с группировкой по `field_id` (fallback на `feat_index`).
-- Работает в append-safe режиме: уже существующие записи в `prep_data` не перераспределяются, новые патчи добавляются.
-- Копирует/линкует файлы в `prep_data/{train,validation,test}/...`.
-- Источник `extent` для обучения берётся из `extent_ig` (0/1/255).
-
-5. `smoke_check_patches.py`
-- Быстрые проверки значений масок:
-  - `valid` in {0,1}
-  - `extent_ig` in {0,1,255}
-  - `bwbl` in {0,1,2}
-- Проверка политики: при `valid=0` ожидается `extent_ig=255` и `bwbl=2`.
-
-### 3.2 Пакет `module_prep_data/prep`
-
-1. `config.py`
-- Typed-конфиги (dataclasses) для всех разделов `prep_config.yaml`.
-- Резолв относительных путей.
-
-2. `utils.py`
-- Вспомогательные функции: поиск файлов по glob, запись/чтение JSON, утилиты CRS.
-
-3. `qa_raster.py`
-- Чтение метаданных растра.
-- Оценка valid_ratio по NoData policy (`control-band`/`all-bands`) через sampling окон.
-
-4. `qa_vector.py`
-- Чтение и проверка вектора.
-- Приведение к CRS растра.
-- Фильтрация non-polygon/empty/small-area.
-- Опциональные in-memory операции с invalid геометриями.
-
-5. `clip_raster.py`
-- Клиппинг растров по геометриям полей.
-- Поддержка `bbox` и `mask`.
-- Опциональный `mask_outside`.
-
-6. `patches.py` (центральный блок)
-- Сэмплинг центров патчей: `center`, `boundary`, `negative`.
-- Растеризация extent и построение boundary карт.
-- Формирование `BWBL` (фон/скелет/буфер).
-- Формирование valid-mask на основе NoData policy.
-- Применение ignore policy на extent/boundary в nodata зоне.
-- Экспорт GeoTIFF + per-patch meta JSON + manifest.
-
----
-
-## 4) Разбор `module_net_train` (что делает каждый блок)
-
-### 4.1 Скрипты `module_net_train/scripts`
-
-1. `01_check_prep_data.py`
-- Индексирует `prep_data` по split.
-- Проверяет наличие обязательных файлов.
-- Проверяет число каналов `img`.
-- Проверяет допустимые значения масок.
-- Пишет summary JSON.
-
-2. `02_train.py`
-- Загружает train/hardware конфиги.
-- Строит runtime-план (device, precision, crop, batch, workers).
-- Индексирует train/val.
-- Считает и сохраняет статистики нормализации (`band_stats.npz`).
-- Создаёт датасеты и dataloaders.
-- Собирает модель, optimizer, scheduler.
-- Запускает train/val loop, пишет history CSV и чекпоинты (`last.pt`, `best.pt`).
-- По настройке делает инференс AOI в конце.
-
-3. `03_predict_aoi.py`
-- Загружает run (`band_stats.npz`, checkpoint).
-- Резолвит AOI raster из manifest по `dataset_key`.
-- Делает tiled inference, пишет:
-  - `extent_prob.tif`
-  - `boundary_prob.tif`
-  - `predict_manifest.json`
-
-4. `04_eval.py`
-- Загружает test split и checkpoint.
-- Считает метрики через `validate_one_epoch`.
-- Пишет `metrics/eval_test.json`.
-
-### 4.2 `net_train/*` по подсистемам
-
-1. `config.py`
-- Загрузка YAML и резолв путей.
-- Вспомогательные функции извлечения nested-полей.
-
-2. `hardware.py`
-- Построение runtime-плана:
-  - `device` (`cpu/cuda`)
-  - `precision` (`fp32/fp16/bf16`)
-  - heuristic autotune для crop/batch/grad_accum
-  - dataloader workers
-- Применение torch runtime flags (`cudnn`, `tf32`).
-
-3. `data/index.py`
-- Формирует индекс samples по `meta_*.json` и ожидаемым путям масок/изображений.
-
-4. `data/stats.py`
-- Вычисляет нормализацию (`robust_percentile` или `mean_std`) по train или выбранному split.
-- Сохраняет/загружает stats в `.npz`.
-
-5. `data/dataset.py`
-- Читает `img`, `extent`, `bwbl`, `valid`.
-- Делает crop/augment.
-- Нормализует спектральные каналы.
-- Добавляет `valid` как дополнительный канал (если включено).
-- Принудительно проставляет ignore значения в таргетах там, где `valid=0`.
-
-6. `data/transforms.py`
-- Простые геометрические аугментации: hflip/vflip/rotate90.
-
-7. `models/unet_multitask.py`
-- U-Net encoder-decoder.
-- Две головы: `extent_logits` и `boundary_logits`.
-
-8. `losses/extent_loss.py`
-- `BCEWithLogits + soft Dice` для extent c ignore-mask.
-
-9. `losses/bwbl_loss.py`
-- `BCEWithLogits` для boundary (класс ignore исключается по маске).
-
-10. `metrics/extent_metrics.py`
-- IoU/F1/Precision/Recall по extent.
-
-11. `metrics/boundary_metrics.py`
-- Boundary F1 с допуском (`dilation_px`) и мульти-threshold.
-
-12. `train/loop.py`
-- Train step с AMP, grad accumulation, grad clipping.
-- Validation (loss + метрики).
-- Сохранение history CSV и checkpoint management.
-
-13. `infer/tiling.py` и `infer/predict_aoi.py`
-- Генерация окон, blending overlap, сбор full-size probability raster.
-
-14. `utils/*`
-- Логирование, I/O, сиды.
-
----
-
-## 5) Входной/выходной контракт данных
-
-`prep_data/<split>/` должен содержать:
+`prep_data/<split>/`:
 
 ```text
 img/img_<patch_id>.tif
-valid/valid_<patch_id>.tif
-extent/extent_<patch_id>.tif
-boundary_bwbl/bwbl_<patch_id>.tif
+valid/valid_<patch_id>.tif           # 0/1
+extent/extent_<patch_id>.tif         # 0/1/255
+boundary_bwbl/bwbl_<patch_id>.tif    # 0/1/2
 meta/meta_<patch_id>.json
 ```
 
-Семантика масок:
+Фактический train контракт:
+- вход модели: `num_bands=8` + `valid` канал (итого `in_channels=9`).
+- boundary head учится по `bwbl`, ignore=`2`.
+- extent head учится по `extent`, ignore=`255`.
 
-- `valid`: 0/1
-- `extent`: 0/1/255 (`255` = ignore)
-- `boundary_bwbl`: 0/1/2 (`2` = ignore/buffer)
+## 6. Принятый baseline (текущее)
 
----
+### Prep baseline
+- `module_prep_data/prep_config.yaml`.
+- Labels после фикса semantics для boundary linework.
+- split и manifests зафиксированы в `prep_data/split_manifest.json`.
 
-## 6) Какие параметры менять, чтобы влиять на результат обучения
+### Train baseline
+- `module_net_train/configs/train_config.yaml` + `configs/hardware_config.yaml`.
+- run baseline: `runs/20260316_103300`.
+- мониторинг best checkpoint: `val/boundary_f1_max`.
 
-Ниже параметры, которые реально дают наибольший эффект на качество/стабильность, без изменения самих исходных входных данных.
+### Inference baseline
+- tiled predict: `window=512`, `stride=384`, `blend=gaussian`.
+- для текущего run invalid-edge guard в predict выключен (`invalid_edge_guard_px=0`).
 
-### 6.1 Параметры с самым сильным влиянием (приоритет 1)
+### Postprocess baseline
+- `module_postprocess_vectorize/configs/postprocess_config.yaml`.
+- фактический runtime определяется не только config, но и RAM-aware деградацией в manifest (`memory_runtime`).
 
-1. `module_net_train/configs/train_config.yaml -> train.optimizer.lr`
-- Самый чувствительный параметр.
-- Слишком высокий `lr` -> нестабильность/прыгающий loss.
-- Слишком низкий -> медленное обучение и недообучение.
-- Практика: пробовать сетку `3e-4`, `1e-3`, `2e-3`.
-
-2. `train.epochs`
-- Больше эпох обычно повышает качество до plateau.
-- Контролировать по `val/extent_iou` и `val/boundary_f1@...`.
-
-3. `loss.weights.extent` и `loss.weights.boundary`
-- Баланс двух задач multitask.
-- Если границы важнее: увеличить `boundary` (например 3.0 -> 4.0/5.0).
-- Если переобучается на boundary и теряет extent: снизить `boundary`.
-
-4. `model.base_channels`, `model.depth`
-- Ёмкость модели.
-- Увеличение улучшает потенциал качества, но растит VRAM и риск переобучения.
-
-5. `sampling.crop_size` (через runtime plan) и `inference.tiling.window_size/stride`
-- Влияет на контекст, стабильность границ, VRAM.
-- Малый crop лучше для памяти, но теряет контекст.
-
-### 6.2 Сильное влияние (приоритет 2)
-
-1. `normalization.type`, `normalization.p_low/p_high`, `normalization.ignore_nodata`
-- Критично для мультиспектральных данных и разных сезонов.
-- `robust_percentile` обычно стабильнее на выбросах.
-
-2. `augmentations.{hflip,vflip,rotate90}`
-- Улучшает обобщение, особенно на малом датасете.
-- Отключать только для диагностики.
-
-3. `loss.extent.{bce_weight,dice_weight}`
-- Баланс "локальная точность vs overlap".
-- Больше Dice помогает на разреженных масках.
-
-4. `scheduler.{warmup_epochs,min_lr}`
-- Влияет на стартовую стабильность и финальную донастройку.
-
-5. `train.grad_clip_norm`
-- Стабилизирует обучение при редких всплесках градиента.
-
-### 6.3 Влияние через подготовку таргетов/сэмплинга (приоритет 3)
-
-Это не изменение raw input-данных, но изменение supervision сигнала:
-
-1. `module_prep_data/prep_config.yaml -> patching.negatives.ratio`
-- Меняет баланс positive/negative патчей.
-
-2. `patching.filters.{min_valid_ratio,min_mask_ratio,max_mask_ratio,neg_max_mask_ratio}`
-- Сильно влияет на "сложность" обучающей выборки.
-
-3. `labels.bwbl.buffer_px`
-- Толщина boundary buffer-класса, влияет на boundary head.
-
-4. `labels.ignore_zone.ignore_radius_px`
-- Размер ignore-зоны вокруг границы для extent.
-
-5. `nodata_policy` + `labels.nodata_ignore_policy`
-- Как учитываются NoData зоны при loss/метриках.
-
----
-
-## 7) Параметры в конфиге, которые сейчас почти не влияют (или не подключены)
-
-По текущей реализации есть параметры, которые декларированы, но фактически не участвуют в вычислениях или участвуют не полностью:
-
-1. `module_prep_data/prep_config.yaml`
-- `patching.sampling.mode`
-- `patching.sampling.samples_per_feature`
-- `patching.sampling.near_nodata.*`
-- `raster_preprocess.*` (convert_dtype/nodata_to_value/compute_band_stats)
-- `qa.raster.require_geotransform` (флаг есть, явной проверки нет)
-
-2. `module_net_train/configs/hardware_config.yaml`
-- `gpu.max_mem_frac` (не применяется в runtime коде)
-- `autotune.test_steps` (runtime probe не реализован, используется heuristic)
-
----
-
-## 8) Что исправлено после ревью
-
-Внесены следующие изменения в код:
-
-1. `module_net_train/scripts/03_predict_aoi.py` и `module_net_train/scripts/04_eval.py`
-- Читают параметры только из модульного конфига `module_net_train/configs/train_config.yaml` (через `--config`).
-- Не зависят от временных YAML-файлов внутри `output_data`.
-
-2. `module_prep_data/prep/patches.py` + `module_prep_data/scripts/03_make_patches.py`
-- В patch metadata добавлен стабильный `field_id`.
-- Источник `field_id`: сначала `vector.id_field` из конфига (если задан и существует), иначе `orig_fid` (если есть), иначе fallback на индекс.
-
-3. `module_prep_data/scripts/04_split_dataset.py`
-- Grouping для split теперь использует `field_id` (а не только `feat_index`).
-- Это снижает риск утечки частей одного и того же поля между `train/validation/test`.
-- Режим по умолчанию: append (новые патчи добавляются к уже существующим в `prep_data`).
-
-4. `module_prep_data/prep/patches.py`
-- Для positive-патчей (`center` и `boundary`) добавлен retry-добор до target-квот (с ограничением max attempts).
-- В `manifest.summary` добавлены `attempts` и `shortfall`.
-
-5. `module_net_train/net_train/train/loop.py`
-- `val/boundary_f1@...` теперь считается из глобально агрегированных `TP/FP/FN` по эпохе, а не усреднением batch-level F1.
-
-6. `module_net_train/net_train/infer/predict_aoi.py`
-- Добавлена валидация tiled-inference параметров:
-  - `window_size > 0`
-  - `stride > 0`
-  - `stride <= window_size`
-  - `batch_size > 0`
-
-### 8.1 Что остаётся в зоне внимания
-
-1. В `module_prep_data` часть параметров конфига всё ещё объявлена, но не подключена в логику (`near_nodata`, `samples_per_feature`, часть `raster_preprocess`).
-2. В `module_net_train` всё ещё нет отдельного набора unit/integration тестов.
-
----
-
-## 9) Минимальный порядок запуска (справка)
+## 7. Быстрый запуск ключевых стадий
 
 Из корня репозитория:
 
 ```bash
-# 1) Подготовка данных
-bash module_prep_data/scripts/run_prep_all.sh
-# По умолчанию: append в prep_data (не пересоздаёт старые сплиты)
-# Полный пересбор сплитов:
-# bash module_prep_data/scripts/run_prep_all.sh --overwrite
+# PREP
+./.venv/bin/python module_prep_data/scripts/01_check_inputs.py --config module_prep_data/prep_config.yaml
+./.venv/bin/python module_prep_data/scripts/02_clip_to_aoi.py --config module_prep_data/prep_config.yaml
+./.venv/bin/python module_prep_data/scripts/03_make_patches.py --config module_prep_data/prep_config.yaml
+./.venv/bin/python module_prep_data/scripts/04_split_dataset.py --config module_prep_data/prep_config.yaml
 
-# 2) Проверка prep_data
-python module_net_train/scripts/01_check_prep_data.py \
-  --config module_net_train/configs/train_config.yaml
-
-# 3) Обучение
-python module_net_train/scripts/02_train.py \
+# TRAIN / INFER / EVAL
+./.venv/bin/python module_net_train/scripts/02_train.py \
   --config module_net_train/configs/train_config.yaml \
   --hardware module_net_train/configs/hardware_config.yaml
 
-# 4) Инференс по run
-python module_net_train/scripts/03_predict_aoi.py \
+./.venv/bin/python module_net_train/scripts/04_eval.py \
   --config module_net_train/configs/train_config.yaml \
   --hardware module_net_train/configs/hardware_config.yaml \
-  --run_dir output_data/module_net_train/runs/<run_id>
+  --run_dir output_data/module_net_train/runs/20260316_103300
 
-# 5) Оценка
-python module_net_train/scripts/04_eval.py \
-  --config module_net_train/configs/train_config.yaml \
-  --hardware module_net_train/configs/hardware_config.yaml \
-  --run_dir output_data/module_net_train/runs/<run_id>
+# POSTPROCESS
+./.venv/bin/python module_postprocess_vectorize/scripts/03_postprocess_run.py \
+  --run_dir output_data/module_net_train/runs/20260316_103300 \
+  --config module_postprocess_vectorize/configs/postprocess_config.yaml
 ```
 
----
+## 8. Ограничения и риски (текущие)
 
-## 10) Куда смотреть в артефактах после обучения
+1. После фикса labels качество boundary улучшено, но итоговый bottleneck теперь не только labels.
+2. Есть **observability mismatch**: не все GT-границы обязательно визуально читаются в текущем imagery.
+3. Near-invalid зона остается слабой по KPI (даже при хорошем global extent F1).
+4. Постобработка на большой сцене может автоматически отключать watershed/gaussian из-за RAM pressure.
+5. Исторических run-baseline в `output_data/module_net_train/runs` сейчас нет (только `20260316_103300`).
 
-`output_data/module_net_train/runs/<run_id>/`
+## 9. Что не нужно начинать заново
 
-- `config_resolved.yaml` — фактический конфиг запуска.
-- `hardware.json` — итоговый runtime план.
-- `band_stats.npz` — нормализация.
-- `logs/train.log` — лог эпох/лосса.
-- `metrics/history.csv` — динамика train/val.
-- `checkpoints/{last.pt,best.pt}` — веса.
-- `pred/<dataset_key>/*` — AOI probability карты.
-- `metrics/eval_test.json` — итог test оценки.
+- Повторное доказательство, что проблема internal boundaries была только “визуализацией в ArcGIS”.
+- Повторный forensic root-cause по старой `boundary_raw` логике.
+- Ручной пересчет уже сохраненных post-rebuild retention-отчетов, если не менялись labels/patching.
 
----
+## 10. Что может потребоваться для GT-like quality (гипотезы/рекомендации)
 
-## 11) Рекомендованный цикл тюнинга
-
-1. Зафиксировать data prep конфиг и seed.
-2. Подобрать `lr`, `epochs`, `loss.weights`, `base_channels`.
-3. Проверить, что `train/val` метрики растут согласованно (без большого gap).
-4. Поиграть `boundary thresholds` и `dilation_px` для целевого применения.
-5. После каждого run сравнивать `history.csv` + `eval_test.json`.
-
----
-
-Если нужен следующий шаг, можно сделать отдельный документ `TUNING_GUIDE.md` с матрицей экспериментов (какой параметр, диапазон, ожидаемый эффект, критерий успеха).
+Это **не подтвержденные факты**, а рабочие направления:
+- более информативные данные (quality/seasonality/доп. каналы);
+- observability-aware label policy;
+- priors из внешнего вектора (shape prior) в inference/postprocess;
+- multi-temporal данные;
+- более сильная специализация модели под near-invalid и boundary ambiguity.

@@ -23,6 +23,7 @@ from net_train.models import build_model
 from net_train.train import load_checkpoint
 from net_train.utils.io import write_json
 from net_train.utils.logging import setup_logger
+from net_train.utils.progress import progress_enabled
 
 
 
@@ -46,6 +47,7 @@ def main() -> int:
 
     console = Console()
     logger = setup_logger("predict_aoi", level=args.log_level)
+    show_progress = progress_enabled(True)
 
     run_dir = Path(args.run_dir).resolve()
     train_config_path, used_run_config = resolve_run_train_config_path(args.config, run_dir)
@@ -178,6 +180,7 @@ def main() -> int:
         invalid_edge_guard_px=guard_px,
         invalid_edge_extent_scale=guard_extent_scale,
         invalid_edge_boundary_scale=guard_boundary_scale,
+        show_progress=show_progress,
     )
 
     pred_info["checkpoint"] = str(ckpt_path)

@@ -1,63 +1,45 @@
 # module_postprocess_vectorize
 
-Автономный модуль постобработки предсказаний сегментации полей:
+Модуль постобработки:
+`extent_prob/boundary_prob -> labels -> polygons`.
 
-`probability rasters -> smoothing -> threshold/barriers -> seeds -> watershed -> labels -> polygonize -> geometry cleanup -> eval/search`
+Описание синхронизировано с фактическими артефактами на **2026-03-16**.
 
-Цель: получить GIS-friendly полигоны полей с приоритетом на корректное разделение соседних объектов и отсутствие дыр/артефактов.
+## 1. Что делает модуль
 
-## Структура
+Пайплайн (`postprocess/pipeline.py`):
+1. Читает probability raster.
+2. Восстанавливает/читает valid-mask контекст.
+3. Сглаживает вероятности.
+4. Строит `field_mask` и boundary barrier.
+5. Строит seeds.
+6. Выполняет watershed (если не отключен runtime policy).
+7. Чистит labels.
+8. Векторизует и очищает геометрию.
+9. Пишет manifest + параметры + артефакты.
 
-```text
-module_postprocess_vectorize/
-  configs/
-    postprocess_config.yaml
-  postprocess/
-    __init__.py
-    io.py
-    raster_ops.py
-    seeds.py
-    separation.py
-    vectorize.py
-    geometry_clean.py
-    metrics.py
-    search.py
-    pipeline.py
-  scripts/
-    01_search_postprocess_params.py
-    02_postprocess_single.py
-    03_postprocess_run.py
-    04_eval_polygons.py
-  README.md
-```
+## 2. Входы
 
-## Входы
+Обязательные:
+- `extent_prob.tif`
+- `boundary_prob.tif`
 
-Основной режим:
-- `extent_prob.tif` (float32, probability поля)
-- `boundary_prob.tif` (float32, probability границы)
-- опционально `valid_mask.tif` (1=valid, 0=invalid)
-- опционально `predict_manifest.json`
-- опционально AOI raster (`aoi_raster` из `predict_manifest.json`)
+Опциональные:
+- `valid_mask.tif`
+- `predict_manifest.json`
+- AOI raster (`aoi_raster` через predict manifest)
 
-Контроль входов:
-- одинаковые `width/height`
-- одинаковые `transform`
-- одинаковые `CRS`
-- проверка/нормализация probability в диапазон `[0, 1]`
+Если `valid_mask.tif` отсутствует:
+- модуль строит valid через `footprint_nodata` (AOI + nodata policy из `config_used`),
+- fallback использует nodata метаданные растра.
 
-Интеграция с `module_net_train`:
-- для batch-режима ожидается структура `output_data/module_net_train/runs/<run_id>/pred/<dataset_key>/...`;
-- current `predict_manifest.json` из `module_net_train` уже содержит:
-  - `extent_prob`
-  - `boundary_prob`
-  - `aoi_raster`
-  - `config_used`
-- если `valid_mask.tif` отсутствует, модуль использует `aoi_raster` и строит valid-mask по current nodata-policy из `config_used`;
-- если `config_used` недоступен, берётся nodata metadata самого AOI raster;
-- только если nodata вообще не определён, используется последний fallback `> 0`.
+## 3. Выходы
 
-## Выходы
+Основные:
+- `fields_pred_raw.gpkg`
+- `fields_pred.gpkg`
+- `postprocess_manifest.json`
+- `params_used.json`
 
 При `save_intermediates=true`:
 - `extent_smooth.tif`
@@ -67,153 +49,83 @@ module_postprocess_vectorize/
 - `seeds.tif`
 - `labels.tif`
 
-Векторы:
-- `fields_pred_raw.gpkg`
-- `fields_pred.gpkg`
-- опционально `fields_pred.shp`
+Для batch-запуска:
+- `postprocess_run_summary.json`
 
-Служебные артефакты:
-- `params_used.json`
-- `postprocess_manifest.json`
-- `metrics_postproc.json` (если передан GT)
-- `search_results.json` + `best_params.yaml` (для search)
+## 4. Конфиг и runtime policy
 
-## Алгоритм пайплайна
+Базовый конфиг:
+- `configs/postprocess_config.yaml`
 
-1. Валидация и загрузка co-registered входных raster.
-2. Маскирование по `valid_mask` или valid-context, восстановленному из `predict_manifest.json`/AOI raster (вне valid всегда фон).
-3. Лёгкое Gaussian сглаживание вероятностей.
-4. `field_mask` из extent threshold + морфологическая очистка.
-5. `boundary_barrier` из boundary threshold + optional dilation.
-6. Seeds/markers: distance transform + local maxima/h-maxima.
-7. Разделение полей: marker-based watershed внутри `field_mask` с учётом boundary-барьера.
-   Для больших AOI включается RAM-aware fallback (graceful: сначала смягчение параметров, при высокой нагрузке отключение watershed).
-8. Очистка `labels`: fill small holes, merge small regions, drop tiny leftovers, relabel.
-9. Векторизация labels в CRS входа.
-10. Геометрическая очистка: `make_valid`, remove holes, min area в m², simplify в метрах, optional straighten, clip к valid area.
+Критично:
+- фактическое поведение определяется не только config, но и RAM-aware runtime policy (`postprocess/runtime.py`).
+- при высокой нагрузке модуль может уменьшать/выключать gaussian, отключать watershed и переключать clean_labels в fast mode.
 
-## Ключевые параметры
+## 5. Фактическое состояние baseline run
 
-В `configs/postprocess_config.yaml` вынесены:
-- `extent_thr`
-- `boundary_thr`
-- `gaussian_sigma_px`
-- `boundary_dilate_px`
-- `min_area_m2`
-- `fill_holes_max_area_m2`
-- `small_region_max_area_m2`
-- `simplify_m`
-- `seed_min_distance_px`
-- `seed_hmax`
-- `marker_erode_px`
-- `use_watershed`
-- `sobel_weight`
-- `remove_holes`
-- `straighten.enabled`
-- `straighten.snap_angle_deg`
-- `save_intermediates`
-- `export_shp`
-- `clip_to_valid`
-- `scoring.metric_name`
-- `memory.prob_dtype`
-- `memory.auto_disable_watershed`
-- `memory.max_pixels_for_watershed`
-- `memory.warn_pixels_threshold`
-- `memory.auto_disable_gaussian_large`
-- `memory.max_pixels_for_gaussian`
-- `memory.sobel_weight_large`
-- `memory.ram_budget_fraction`, `memory.ram_guard_mb`, `memory.min_ram_budget_mb`
-- `memory.degrade_gaussian_pressure`, `memory.disable_watershed_pressure`
-- `memory.clean_labels_mode`, `memory.clean_labels_fast_pixels_threshold`
+Run:
+- `output_data/module_net_train/runs/20260316_103300`
 
-## CLI
+Ключевые postprocess артефакты:
+- `postprocess/postprocess_run_summary.json`
+- `postprocess/first_raster/postprocess_manifest.json`
+- `postprocess/first_raster/params_used.json`
 
-### 1) Search параметров на validation
+Факты из manifest:
+- `valid_source=footprint_nodata`
+- `estimated_pressure=2.7987` (существенно выше бюджета)
+- `gaussian_sigma_px_effective=0.0`
+- `use_watershed=false`
+- `clean_labels_mode=fast`
+- предупреждения содержат `estimated_peak_exceeds_ram_budget`
+
+Это важно при интерпретации качества: результат зависит не только от `postprocess_config.yaml`, но и от runtime деградации на большой сцене.
+
+## 6. Команды
+
+Из корня репозитория:
 
 ```bash
-./.venv/bin/python module_postprocess_vectorize/scripts/01_search_postprocess_params.py \
-  --pred_root output_data/module_net_train/runs/20260313_112627/pred \
-  --gt_root <path_to_gt_vectors_or_gt_label_rasters> \
-  --config module_postprocess_vectorize/configs/postprocess_config.yaml \
-  --output_dir output_data/module_postprocess_vectorize/search/<search_id>
-```
-
-Результат:
-- `best_params.yaml`
-- `search_results.json`
-
-### 2) Постобработка одной пары raster
-
-```bash
+# Single sample (через predict_manifest)
 ./.venv/bin/python module_postprocess_vectorize/scripts/02_postprocess_single.py \
-  --predict_manifest output_data/module_net_train/runs/20260313_112627/pred/first_raster/predict_manifest.json \
+  --predict_manifest output_data/module_net_train/runs/20260316_103300/pred/first_raster/predict_manifest.json \
   --config module_postprocess_vectorize/configs/postprocess_config.yaml \
-  --output_dir output_data/module_postprocess_vectorize/single/<sample_id>
-```
+  --output_dir output_data/module_postprocess_vectorize/single/first_raster
 
-Также поддерживаются режимы:
-- явная пара `--extent_prob` + `--boundary_prob`
-- `--run_dir output_data/module_net_train/runs/<run_id> --dataset_key first_raster`
-
-### 3) Пакетная постобработка run_dir
-
-```bash
+# Batch по run_dir
 ./.venv/bin/python module_postprocess_vectorize/scripts/03_postprocess_run.py \
-  --run_dir output_data/module_net_train/runs/20260313_112627 \
-  --config module_postprocess_vectorize/configs/postprocess_config.yaml \
-  --params_override output_data/module_postprocess_vectorize/search/<search_id>/best_params.yaml
-```
+  --run_dir output_data/module_net_train/runs/20260316_103300 \
+  --config module_postprocess_vectorize/configs/postprocess_config.yaml
 
-По умолчанию:
-- вход: `<run_dir>/pred/**/extent_prob.tif`, `boundary_prob.tif`
-- выход: `<run_dir>/postprocess/<sample_id>/...`
-- для каждого sample дополнительно пишется `postprocess_manifest.json` с входами, valid-source, valid-context и outputs.
-
-Memory-safe поведение:
-- для крупных raster модуль автоматически снижает память (`prob_dtype=float16`);
-- RAM-aware planner оценивает доступную память и размер сцены перед тяжёлыми стадиями;
-- Gaussian fallback теперь staged: сначала уменьшение `sigma`, полное отключение только при высокой memory pressure;
-- watershed отключается только при hard-guard (`max_pixels_*`) или при оценке риска OOM;
-- `clean_labels` автоматически переключается в fast-mode на больших сценах.
-
-### 5) Один shell-скрипт для запуска модуля целиком
-
-```bash
-./module_postprocess_vectorize/scripts/run_postprocess_all.sh \
-  --run_dir output_data/module_net_train/runs/20260313_112627 \
-  --gt_root <path_to_gt_vectors_or_gt_rasters> \
-  --gt_mode vector
-```
-
-Поведение:
-- `--run_dir` можно не указывать: скрипт сам выберет последний `runs/*`;
-- если в выбранном run нет `extent_prob.tif/boundary_prob.tif`, скрипт автоматически вызовет `module_net_train/scripts/03_predict_aoi.py`;
-- если передан `--gt_root` и нет `--params_override`, сначала запускается `01_search_postprocess_params.py`;
-- затем запускается `03_postprocess_run.py` на весь `run_dir`;
-- если `--params_override` передан, search-этап пропускается.
-
-### 4) Оценка полигонов
-
-```bash
+# Polygon eval (если есть GT)
 ./.venv/bin/python module_postprocess_vectorize/scripts/04_eval_polygons.py \
-  --gt <gt_vector_or_gt_label_raster> \
-  --pred <pred_vector_or_pred_label_raster> \
-  --iou_threshold 0.5 \
-  --out_json output_data/module_postprocess_vectorize/eval.json
+  --gt <gt_vector_or_gt_raster> \
+  --pred output_data/module_net_train/runs/20260316_103300/postprocess/first_raster/fields_pred.gpkg \
+  --out_json output_data/module_postprocess_vectorize/eval_20260316.json
 ```
 
-Метрики:
-- `gt_count`, `pred_count`
-- `tp`, `fp`, `fn`
-- `precision`, `recall`, `f1`
-- `mean_iou_matched`
-- `merge_penalty`, `holes_penalty`, `invalid_geometries`
-- `area_precision`, `area_recall`, `area_f1`
+## 7. Progress UX в терминале
 
-## Рекомендуемый workflow
+- Добавлен прогресс для:
+  - batch postprocess по sample-ам;
+  - шагов pipeline в `run_postprocess_pipeline`;
+  - grid-search trials;
+  - polygon loading/eval loops на больших наборах.
+- Для nested loops часть внутренних баров намеренно отключена, чтобы не зашумлять терминал.
+- Управление через env:
+  - `DISABLE_PROGRESS=1`
+  - `FORCE_PROGRESS=1`
 
-1. `01_search_postprocess_params.py` на validation split.
-2. Проверить `search_results.json`, выбрать `best_params.yaml`.
-3. Прогнать `03_postprocess_run.py` на нужном `run_dir`.
-4. Визуально проверить intermediates (`field_mask`, `boundary_barrier`, `seeds`, `labels`).
-5. Использовать `fields_pred.gpkg` (и optional `.shp`) для GIS/дальнейшей аналитики.
+## 8. Что смотреть в первую очередь
+
+1. `postprocess/postprocess_run_summary.json`
+2. `postprocess/first_raster/postprocess_manifest.json`
+3. `postprocess/first_raster/params_used.json`
+4. `postprocess/first_raster/labels.tif`
+5. `postprocess/first_raster/fields_pred.gpkg`
+
+## 9. Ограничения
+
+1. Даже после исправления labels upstream, качество полигонов ограничено качеством model probabilities.
+2. Для текущей сцены runtime policy отключает watershed из-за memory pressure.
+3. Есть observability limit: часть GT-границ может быть неявно наблюдаема в imagery, поэтому GT-like разделение не всегда достижимо только постобработкой.

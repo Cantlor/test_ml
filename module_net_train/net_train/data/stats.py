@@ -8,6 +8,7 @@ import numpy as np
 import rasterio
 
 from net_train.data.index import SampleRecord
+from net_train.utils.progress import iter_progress
 
 
 @dataclass
@@ -68,6 +69,7 @@ def compute_normalization_stats(
     max_pixels_per_image: int = 25000,
     seed: int = 123,
     image_bands: int = 8,
+    show_progress: bool | None = None,
 ) -> NormalizationStats:
     rng = np.random.default_rng(seed)
 
@@ -78,7 +80,15 @@ def compute_normalization_stats(
     rule = str(nodata_rule or "control-band").strip().lower()
     cb = max(0, int(control_band_1based) - 1)
 
-    for rec in records:
+    rec_iter = iter_progress(
+        records,
+        total=len(records),
+        desc="norm-stats",
+        unit="image",
+        enabled=show_progress,
+        leave=False,
+    )
+    for rec in rec_iter:
         with rasterio.open(rec.img_path) as ds:
             img = ds.read().astype(np.float32)
 

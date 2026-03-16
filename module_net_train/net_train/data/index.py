@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from net_train.utils.io import read_json
+from net_train.utils.progress import iter_progress
 
 
 @dataclass
@@ -36,7 +37,7 @@ def _expected_paths(split_root: Path, patch_id: str) -> Dict[str, Path]:
     }
 
 
-def build_index_for_split(prep_data_root: Path, split_name: str) -> IndexResult:
+def build_index_for_split(prep_data_root: Path, split_name: str, show_progress: bool | None = None) -> IndexResult:
     split_root = prep_data_root / split_name
     meta_dir = split_root / "meta"
 
@@ -46,7 +47,16 @@ def build_index_for_split(prep_data_root: Path, split_name: str) -> IndexResult:
     records: List[SampleRecord] = []
     missing: List[str] = []
 
-    for meta_path in sorted(meta_dir.glob("meta_*.json")):
+    meta_paths = sorted(meta_dir.glob("meta_*.json"))
+    meta_iter = iter_progress(
+        meta_paths,
+        total=len(meta_paths),
+        desc=f"index:{split_name}",
+        unit="meta",
+        enabled=show_progress,
+        leave=False,
+    )
+    for meta_path in meta_iter:
         meta = read_json(meta_path)
         patch_id = str(meta.get("patch_id", "")).strip()
         dataset = str(meta.get("dataset", "unknown"))
@@ -78,8 +88,25 @@ def build_index_for_split(prep_data_root: Path, split_name: str) -> IndexResult:
     return IndexResult(split=split_name, records=records, missing_files=missing)
 
 
-def build_index(prep_data_root: Path, splits: Dict[str, str]) -> Dict[str, IndexResult]:
+def build_index(
+    prep_data_root: Path,
+    splits: Dict[str, str],
+    show_progress: bool | None = None,
+) -> Dict[str, IndexResult]:
     out: Dict[str, IndexResult] = {}
-    for alias, split_name in splits.items():
-        out[alias] = build_index_for_split(prep_data_root=prep_data_root, split_name=split_name)
+    split_items = list(splits.items())
+    split_iter = iter_progress(
+        split_items,
+        total=len(split_items),
+        desc="index-splits",
+        unit="split",
+        enabled=show_progress,
+        leave=False,
+    )
+    for alias, split_name in split_iter:
+        out[alias] = build_index_for_split(
+            prep_data_root=prep_data_root,
+            split_name=split_name,
+            show_progress=show_progress,
+        )
     return out

@@ -134,7 +134,7 @@ train:
   seed: 203
   deterministic: false
 
-  epochs: 20
+  epochs: 40
   # Можно переключить на iters, если хочешь строгий контроль:
   # max_steps: null
 
@@ -158,6 +158,11 @@ train:
 
   log_every_n_steps: 20
   val_every_epochs: 1
+
+  diagnostics:
+    # Радиус near-invalid полосы для train/eval KPI около valid/NoData границы.
+    # Используется только в диагностике/метриках, не меняет loss или архитектуру.
+    near_invalid_radius_px: 2
 
   checkpoint:
     save_last: true

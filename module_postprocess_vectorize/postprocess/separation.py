@@ -9,6 +9,8 @@ from skimage import morphology
 from skimage.filters import sobel
 from skimage.segmentation import watershed
 
+from .progress import iter_progress
+
 
 _HAS_RSH_MAX_SIZE = "max_size" in inspect.signature(morphology.remove_small_holes).parameters
 
@@ -55,16 +57,29 @@ def split_fields(
     return labels.astype(np.int32)
 
 
-def _relabel_consecutive(labels: np.ndarray) -> np.ndarray:
+def _relabel_consecutive(labels: np.ndarray, show_progress: bool | None = None) -> np.ndarray:
     out = np.zeros_like(labels, dtype=np.int32)
     uniq = np.unique(labels)
     uniq = uniq[uniq > 0]
-    for new_id, old_id in enumerate(uniq.tolist(), start=1):
+    uniq_list = uniq.tolist()
+    relabel_iter = iter_progress(
+        uniq_list,
+        total=len(uniq_list),
+        desc="relabel",
+        unit="label",
+        enabled=show_progress,
+        leave=False,
+    )
+    for new_id, old_id in enumerate(relabel_iter, start=1):
         out[labels == old_id] = new_id
     return out
 
 
-def _fill_small_holes_per_label(labels: np.ndarray, max_hole_area_px: int) -> np.ndarray:
+def _fill_small_holes_per_label(
+    labels: np.ndarray,
+    max_hole_area_px: int,
+    show_progress: bool | None = None,
+) -> np.ndarray:
     if max_hole_area_px <= 0:
         return labels
 
@@ -72,7 +87,15 @@ def _fill_small_holes_per_label(labels: np.ndarray, max_hole_area_px: int) -> np
     uniq = np.unique(out)
     uniq = uniq[uniq > 0]
 
-    for lbl in uniq:
+    fill_iter = iter_progress(
+        uniq.tolist(),
+        total=int(uniq.size),
+        desc="fill-holes",
+        unit="label",
+        enabled=show_progress,
+        leave=False,
+    )
+    for lbl in fill_iter:
         mask = out == lbl
         if not np.any(mask):
             continue
@@ -102,7 +125,13 @@ def _fill_small_holes_fast(labels: np.ndarray, max_hole_area_px: int) -> np.ndar
     return out
 
 
-def _merge_small_regions(labels: np.ndarray, max_area_px: int, mode: str, max_exact_regions: int) -> np.ndarray:
+def _merge_small_regions(
+    labels: np.ndarray,
+    max_area_px: int,
+    mode: str,
+    max_exact_regions: int,
+    show_progress: bool | None = None,
+) -> np.ndarray:
     if max_area_px <= 0:
         return labels
 
@@ -127,7 +156,15 @@ def _merge_small_regions(labels: np.ndarray, max_area_px: int, mode: str, max_ex
     # Small-first strategy to reduce fragmented islands.
     small_sorted = sorted(small.tolist(), key=lambda x: sizes[x])
 
-    for lbl in small_sorted:
+    merge_iter = iter_progress(
+        small_sorted,
+        total=len(small_sorted),
+        desc="merge-small",
+        unit="label",
+        enabled=show_progress,
+        leave=False,
+    )
+    for lbl in merge_iter:
         region = out == lbl
         if not np.any(region):
             continue
@@ -150,7 +187,7 @@ def _merge_small_regions(labels: np.ndarray, max_area_px: int, mode: str, max_ex
     return out
 
 
-def _drop_tiny_regions(labels: np.ndarray, min_area_px: int) -> np.ndarray:
+def _drop_tiny_regions(labels: np.ndarray, min_area_px: int, show_progress: bool | None = None) -> np.ndarray:
     if min_area_px <= 0:
         return labels
 
@@ -161,7 +198,16 @@ def _drop_tiny_regions(labels: np.ndarray, min_area_px: int) -> np.ndarray:
     if tiny.size == 0:
         return out
 
-    for lbl in tiny.tolist():
+    tiny_list = tiny.tolist()
+    drop_iter = iter_progress(
+        tiny_list,
+        total=len(tiny_list),
+        desc="drop-tiny",
+        unit="label",
+        enabled=show_progress,
+        leave=False,
+    )
+    for lbl in drop_iter:
         out[out == lbl] = 0
     return out
 
@@ -175,6 +221,7 @@ def clean_labels(
     mode: str = "auto",
     max_exact_hole_labels: int = 512,
     max_exact_merge_regions: int = 2048,
+    show_progress: bool | None = None,
 ) -> np.ndarray:
     """
     Clean raster labels:
@@ -199,16 +246,26 @@ def clean_labels(
     if hole_mode == "fast":
         out = _fill_small_holes_fast(out, int(fill_holes_max_area_px))
     else:
-        out = _fill_small_holes_per_label(out, int(fill_holes_max_area_px))
+        out = _fill_small_holes_per_label(
+            out,
+            int(fill_holes_max_area_px),
+            show_progress=show_progress,
+        )
 
     merge_mode = mode
     if mode == "auto":
         merge_mode = "exact"
-    out = _merge_small_regions(out, int(small_region_max_area_px), mode=merge_mode, max_exact_regions=int(max_exact_merge_regions))
-    out = _drop_tiny_regions(out, int(min_region_area_px))
+    out = _merge_small_regions(
+        out,
+        int(small_region_max_area_px),
+        mode=merge_mode,
+        max_exact_regions=int(max_exact_merge_regions),
+        show_progress=show_progress,
+    )
+    out = _drop_tiny_regions(out, int(min_region_area_px), show_progress=show_progress)
 
     out[~valid_mask.astype(bool)] = 0
-    out = _relabel_consecutive(out)
+    out = _relabel_consecutive(out, show_progress=show_progress)
     return out.astype(np.int32)
 
 

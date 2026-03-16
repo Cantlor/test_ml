@@ -11,14 +11,29 @@ from rasterio.transform import Affine
 from shapely.geometry import MultiPolygon, Polygon, shape
 from shapely.ops import unary_union
 
+from .progress import iter_progress
 
-def labels_to_geodataframe(labels: np.ndarray, transform: Affine, crs: CRS) -> gpd.GeoDataFrame:
+
+def labels_to_geodataframe(
+    labels: np.ndarray,
+    transform: Affine,
+    crs: CRS,
+    show_progress: bool | None = None,
+) -> gpd.GeoDataFrame:
     """Vectorize integer label raster into polygons (one row per label component)."""
     arr = labels.astype(np.int32, copy=False)
     mask = arr > 0
 
     records = []
-    for geom_json, value in shapes(arr, mask=mask, transform=transform):
+    shape_iter = iter_progress(
+        shapes(arr, mask=mask, transform=transform),
+        total=None,
+        desc="vectorize-labels",
+        unit="shape",
+        enabled=show_progress,
+        leave=False,
+    )
+    for geom_json, value in shape_iter:
         label_id = int(value)
         if label_id <= 0:
             continue
@@ -38,14 +53,26 @@ def labels_to_geodataframe(labels: np.ndarray, transform: Affine, crs: CRS) -> g
     return gdf
 
 
-def valid_mask_to_geometry(valid_mask: np.ndarray, transform: Affine) -> Optional[Polygon | MultiPolygon]:
+def valid_mask_to_geometry(
+    valid_mask: np.ndarray,
+    transform: Affine,
+    show_progress: bool | None = None,
+) -> Optional[Polygon | MultiPolygon]:
     """Convert valid mask to union geometry for optional clipping."""
     mask = valid_mask.astype(np.uint8)
     if int(mask.sum()) == 0:
         return None
 
     geoms = []
-    for geom_json, value in shapes(mask, mask=mask.astype(bool), transform=transform):
+    shape_iter = iter_progress(
+        shapes(mask, mask=mask.astype(bool), transform=transform),
+        total=None,
+        desc="vectorize-valid",
+        unit="shape",
+        enabled=show_progress,
+        leave=False,
+    )
+    for geom_json, value in shape_iter:
         if int(value) != 1:
             continue
         geom = shape(geom_json)

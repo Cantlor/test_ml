@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from module_postprocess_vectorize.postprocess.inputs import resolve_prediction_sample_from_manifest, resolve_prediction_sample_from_run
 from module_postprocess_vectorize.postprocess.pipeline import load_config, run_postprocess_pipeline
+from module_postprocess_vectorize.postprocess.progress import progress_enabled
 
 
 def setup_logger(level: str) -> logging.Logger:
@@ -46,6 +47,7 @@ def main() -> int:
 
     logger = setup_logger(args.log_level)
     console = Console()
+    show_progress = progress_enabled(True)
 
     cfg = load_config(
         config_path=Path(args.config),
@@ -113,6 +115,7 @@ def main() -> int:
         config=cfg,
         save_outputs=True,
         logger=logger,
+        show_progress=show_progress,
     )
 
     logger.info("Labels stats: %s", out["labels_stats"])

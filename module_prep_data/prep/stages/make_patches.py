@@ -15,6 +15,7 @@ from ..artifacts import (
 from ..config import load_config
 from ..manifests import PatchesDatasetResult, PatchesManifest
 from ..patches import PatchConfig, make_patches_for_dataset
+from ..progress import iter_progress
 from ..utils import ensure_dir
 
 
@@ -114,7 +115,15 @@ def run(config_path: str | Path, n_override: Optional[int] = None, seed_override
     )
 
     datasets_manifest: List[PatchesDatasetResult] = []
-    for ds in cfg.datasets:
+    show_progress = bool(cfg.performance.progress)
+    ds_iter = iter_progress(
+        cfg.datasets,
+        total=len(cfg.datasets),
+        desc="make-patches",
+        unit="dataset",
+        enabled=show_progress,
+    )
+    for ds in ds_iter:
         raster_path, raster_source, vector_path, vector_layer = resolve_patch_inputs_for_dataset(
             cfg=cfg,
             ds=ds,
@@ -158,6 +167,7 @@ def run(config_path: str | Path, n_override: Optional[int] = None, seed_override
             apply_nodata_ignore_policy=nodata_ignore_enabled,
             nodata_ignore_extent_value=nodata_ignore_extent_value,
             nodata_ignore_bwbl_value=nodata_ignore_bwbl_value,
+            show_progress=show_progress,
             seed=seed,
             target_patches=target,
         )

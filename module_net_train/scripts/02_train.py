@@ -26,6 +26,7 @@ from net_train.models import build_model
 from net_train.train import CheckpointManager, create_optimizer, create_scheduler, load_checkpoint, run_training
 from net_train.utils.io import ensure_dir, utc_now_compact, write_json
 from net_train.utils.logging import setup_logger
+from net_train.utils.progress import progress_enabled
 from net_train.utils.seed import make_torch_generator, seed_dataloader_worker, seed_everything
 
 
@@ -75,6 +76,7 @@ def main() -> int:
 
     logger = setup_logger("train", level=args.log_level, log_file=run_dir / "logs" / "train.log")
     console = Console()
+    show_progress = progress_enabled(True)
 
     plan = build_runtime_plan(train_cfg, hw_cfg)
     apply_torch_runtime_flags(plan)
@@ -106,7 +108,7 @@ def main() -> int:
     }
 
     prep_data_root = train_cfg.paths["prep_data_root"]
-    index = build_index(prep_data_root=prep_data_root, splits=splits)
+    index = build_index(prep_data_root=prep_data_root, splits=splits, show_progress=show_progress)
 
     for key in ["train", "val"]:
         if index[key].missing_files:
@@ -172,6 +174,7 @@ def main() -> int:
         p_high=float(norm_cfg.get("p_high", 98.0)),
         seed=seed,
         image_bands=num_bands,
+        show_progress=show_progress,
     )
     save_stats_npz(run_dir / "band_stats.npz", norm_stats)
 
@@ -317,6 +320,7 @@ def main() -> int:
         ckpt_manager=ckpt_manager,
         history_csv_path=run_dir / "metrics" / "history.csv",
         logger=logger,
+        show_progress=show_progress,
     )
 
     do_infer = bool((train_cfg.raw.get("inference", {}) or {}).get("enabled", True)) and not args.no_infer
@@ -382,6 +386,7 @@ def main() -> int:
             invalid_edge_guard_px=guard_px,
             invalid_edge_extent_scale=guard_extent_scale,
             invalid_edge_boundary_scale=guard_boundary_scale,
+            show_progress=show_progress,
         )
         pred_info["checkpoint"] = str(ckpt_path)
         pred_info["checkpoint_fallback_used"] = bool(checkpoint_fallback_used)
