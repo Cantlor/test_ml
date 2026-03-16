@@ -23,7 +23,7 @@ def setup_logger(level: str) -> logging.Logger:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(rich_tracebacks=True)],
+        handlers=[RichHandler(rich_tracebacks=True, show_path=False)],
     )
     return logging.getLogger("prep_check")
 

@@ -109,6 +109,17 @@ class PatchingFilters:
 
 
 @dataclass
+class PatchBudgetConfig:
+    mode: str = "fixed"  # fixed | auto
+    min_valid_patches_to_keep: int = 1
+    min_patches_per_dataset: int = 0
+    max_patches_per_dataset: int = 0  # <=0 means unlimited
+    capacity_overlap_factor: float = 0.35
+    boundary_pixels_per_patch: float = 0.0  # <=0 means auto (patch_size_px * 1.25)
+    valid_ratio_sample_windows: int = 24
+
+
+@dataclass
 class PatchingConfig:
     patch_size_px: int = 512
     train_crop_px: int = 256
@@ -126,6 +137,7 @@ class PatchingConfig:
 
     near_nodata: NearNoDataConfig = field(default_factory=NearNoDataConfig)
     filters: PatchingFilters = field(default_factory=PatchingFilters)
+    patch_budget: PatchBudgetConfig = field(default_factory=PatchBudgetConfig)
 
 
 @dataclass
@@ -347,6 +359,7 @@ def load_config(config_path: str | Path) -> Config:
     w_raw = s_raw.get("weights", {}) or {}
     f_raw = p_raw.get("filters", {}) or {}
     near_raw = s_raw.get("near_nodata", {}) or {}
+    pb_raw = p_raw.get("patch_budget", {}) or {}
 
     patching = PatchingConfig(
         patch_size_px=int(p_raw.get("patch_size_px", 512)),
@@ -370,6 +383,15 @@ def load_config(config_path: str | Path) -> Config:
             min_mask_ratio=float(f_raw.get("min_mask_ratio", 0.03)),
             max_mask_ratio=float(f_raw.get("max_mask_ratio", 0.90)),
             neg_max_mask_ratio=float(f_raw.get("neg_max_mask_ratio", 0.01)),
+        ),
+        patch_budget=PatchBudgetConfig(
+            mode=str(pb_raw.get("mode", "fixed")),
+            min_valid_patches_to_keep=int(pb_raw.get("min_valid_patches_to_keep", 1)),
+            min_patches_per_dataset=int(pb_raw.get("min_patches_per_dataset", 0)),
+            max_patches_per_dataset=int(pb_raw.get("max_patches_per_dataset", 0)),
+            capacity_overlap_factor=float(pb_raw.get("capacity_overlap_factor", 0.35)),
+            boundary_pixels_per_patch=float(pb_raw.get("boundary_pixels_per_patch", 0.0)),
+            valid_ratio_sample_windows=int(pb_raw.get("valid_ratio_sample_windows", 24)),
         ),
     )
 

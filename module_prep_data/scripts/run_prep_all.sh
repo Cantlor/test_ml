@@ -108,6 +108,7 @@ print(float(ratios.get("validation", 0.10)))
 print(float(ratios.get("test", 0.10)))
 print(str(work_dir))
 print(str(prep_data_dir))
+print(str((patching.get("patch_budget", {}) or {}).get("mode", "fixed")).strip().lower())
 PY
 )
 
@@ -118,11 +119,27 @@ CFG_VAL_RATIO="${CFG_VALUES[3]}"
 CFG_TEST_RATIO="${CFG_VALUES[4]}"
 CFG_WORK_DIR="${CFG_VALUES[5]}"
 CFG_PREP_DATA_DIR="${CFG_VALUES[6]}"
+CFG_BUDGET_MODE="${CFG_VALUES[7]}"
 
-EFFECTIVE_N_PATCHES="${N_PATCHES:-${CFG_N_PATCHES}}"
 EFFECTIVE_SEED="${SEED:-${CFG_SEED}}"
-NP_SRC=$([[ -n "${N_PATCHES}" ]] && echo "cli" || echo "config")
 SEED_SRC=$([[ -n "${SEED}" ]] && echo "cli" || echo "config")
+EFFECTIVE_BUDGET_MODE="${CFG_BUDGET_MODE}"
+PASS_N_TO_PATCHES="0"
+
+if [[ -n "${N_PATCHES}" ]]; then
+  EFFECTIVE_N_PATCHES="${N_PATCHES}"
+  NP_SRC="cli"
+  EFFECTIVE_BUDGET_MODE="fixed"
+  PASS_N_TO_PATCHES="1"
+elif [[ "${CFG_BUDGET_MODE}" == "fixed" ]]; then
+  EFFECTIVE_N_PATCHES="${CFG_N_PATCHES}"
+  NP_SRC="config(fixed)"
+  PASS_N_TO_PATCHES="1"
+else
+  # In auto mode we do not pass --n so 03_make_patches can derive per-dataset targets.
+  EFFECTIVE_N_PATCHES="${CFG_N_PATCHES}"
+  NP_SRC="config(auto informational)"
+fi
 
 cd "${MOD_ROOT}"
 
@@ -130,6 +147,7 @@ step "Environment"
 echo "module_prep_data: ${MOD_ROOT}"
 echo "project_root:     ${PROJ_ROOT}"
 echo "config:           ${CONFIG}"
+echo "patch_budget:     ${EFFECTIVE_BUDGET_MODE} (config=${CFG_BUDGET_MODE})"
 echo "n_patches:        ${EFFECTIVE_N_PATCHES} (${NP_SRC})"
 echo "seed:             ${EFFECTIVE_SEED} (${SEED_SRC})"
 echo "split_ratios:     train=${CFG_TRAIN_RATIO} val=${CFG_VAL_RATIO} test=${CFG_TEST_RATIO} (config)"
@@ -161,7 +179,11 @@ fi
 
 # ---------- 03_make_patches ----------
 step "03_make_patches.py (generate patches_all/*)"
-${PY} scripts/03_make_patches.py --config "${CONFIG}" --n "${EFFECTIVE_N_PATCHES}" --seed "${EFFECTIVE_SEED}"
+PATCH_ARGS=( --config "${CONFIG}" --seed "${EFFECTIVE_SEED}" )
+if [[ "${PASS_N_TO_PATCHES}" == "1" ]]; then
+  PATCH_ARGS+=( --n "${EFFECTIVE_N_PATCHES}" )
+fi
+${PY} scripts/03_make_patches.py "${PATCH_ARGS[@]}"
 ok "03_make_patches finished"
 
 # ---------- 04_split_dataset ----------

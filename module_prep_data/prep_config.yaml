@@ -73,6 +73,15 @@ patching:
   pad_px: 16
   target_patches_per_dataset: 1000
 
+  patch_budget:
+    mode: auto                      # fixed | auto
+    min_valid_patches_to_keep: 120  # dataset with lower estimated capacity will be skipped
+    min_patches_per_dataset: 0
+    max_patches_per_dataset: 0      # <=0 means unlimited
+    capacity_overlap_factor: 0.35
+    boundary_pixels_per_patch: 0.0  # <=0 -> auto (patch_size_px * 1.25)
+    valid_ratio_sample_windows: 24
+
   sampling:
     mode: mixed
     weights:

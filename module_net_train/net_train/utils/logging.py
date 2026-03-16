@@ -14,7 +14,7 @@ def setup_logger(name: str, level: str = "INFO", log_file: Optional[Path] = None
 
     fmt = logging.Formatter("%(message)s")
 
-    rich_handler = RichHandler(rich_tracebacks=True)
+    rich_handler = RichHandler(rich_tracebacks=True, show_path=False)
     rich_handler.setFormatter(fmt)
     logger.addHandler(rich_handler)
 

@@ -24,6 +24,7 @@
 - `datasets.*`
 - `nodata_policy.*`
 - `patching.*`
+- `patching.patch_budget.*`
 - `labels.*`
 - `split.*`
 - `export.*`
@@ -67,11 +68,20 @@
 Что делает:
 - генерирует `img`, `extent`, `extent_ig`, `boundary_raw`, `boundary_bwbl`, `valid`, `meta`;
 - применяет NoData ignore policy на таргеты.
+- рассчитывает patch budget:
+  - `patch_budget.mode=fixed`: используется `target_patches_per_dataset`;
+  - `patch_budget.mode=auto`: target считается по каждому dataset отдельно от оцененной емкости данных
+    (raster/valid/field/boundary/negative capacity) с сохранением долей `center/boundary/negative`.
+- при `auto` и слишком низкой емкости dataset помечается как `skipped` по порогу
+  `patch_budget.min_valid_patches_to_keep` (без принудительного добора патчей).
+- поддерживает dry-run preview budget без генерации patch-файлов:
+  `scripts/03_make_patches.py --dry-run-budget`.
 
 Ключевые артефакты:
 - `output_data/module_prep_data_work/patches_manifest.json`
 - `output_data/module_prep_data_work/patches_all/<dataset>/manifest.json`
 - `output_data/module_prep_data_work/patches_all/<dataset>/{img,extent,extent_ig,boundary_raw,boundary_bwbl,valid,meta}`
+- `output_data/module_prep_data_work/patch_budget_report.json` (для dry-run preview)
 
 ### Stage 4: split_dataset
 Скрипт:
@@ -101,6 +111,14 @@
 - `boundary_bwbl/bwbl_<patch_id>.tif`
 - `valid/valid_<patch_id>.tif`
 - `meta/meta_<patch_id>.json`
+
+`manifest.json` внутри dataset теперь дополнительно содержит расширенный `summary` с полями
+auto-budget (если включен `patch_budget.mode=auto`), включая:
+- `patch_budget_mode`, `patch_size_px`
+- `estimated_*_capacity`, `estimated_*_target`
+- `valid_area_pixels`, `valid_area_ratio`, `field_area_pixels`, `boundary_length_pixels`
+- `skipped_due_to_low_capacity`, `skip_reason`
+- `shortfall_reasons` (если фактически записано меньше target)
 
 ### prep_data (после split)
 `prep_data/<split>/`:
@@ -137,6 +155,11 @@
 - в `check_inputs` есть warning: `valid_ratio_estimate=0.6794 < 0.7`
 - в `patches_all` есть shortfall по negatives (`97` вместо target `150`)
 
+Важно:
+- эти значения относятся к последнему уже выполненному prep-run;
+- при `patch_budget.mode=auto` будущие run'ы могут иметь разные target/written по datasets,
+  и это ожидаемое поведение.
+
 Ключевые файлы:
 - `output_data/module_prep_data_work/check_inputs_manifest.json`
 - `output_data/module_prep_data_work/aoi_manifest.json`
@@ -156,6 +179,11 @@
 ./.venv/bin/python module_prep_data/scripts/03_make_patches.py --config module_prep_data/prep_config.yaml
 ./.venv/bin/python module_prep_data/scripts/04_split_dataset.py --config module_prep_data/prep_config.yaml
 
+# Dry-run diagnostics: preview budget/capacity per dataset
+./.venv/bin/python module_prep_data/scripts/03_make_patches.py \
+  --config module_prep_data/prep_config.yaml \
+  --dry-run-budget
+
 # Быстрый smoke-check по значениям масок
 ./.venv/bin/python module_prep_data/scripts/smoke_check_patches.py \
   --patches_all output_data/module_prep_data_work/patches_all --k 12
@@ -166,6 +194,7 @@ bash module_prep_data/scripts/run_prep_all.sh --config module_prep_data/prep_con
 
 Опции:
 - `03_make_patches.py`: `--n`, `--seed`
+- `03_make_patches.py` (preview): `--dry-run-budget`, `--budget-report-out`
 - `04_split_dataset.py`: `--patches_manifest`, `--seed`, `--overwrite`
 - `run_prep_all.sh`: `--n`, `--seed`, `--overwrite`, `--pytest`
 
@@ -186,6 +215,8 @@ bash module_prep_data/scripts/run_prep_all.sh --config module_prep_data/prep_con
 - `tests/test_patching_invariants.py`
 - `tests/test_prep_pipeline.py`
 - `tests/test_cli_smoke.py`
+- `tests/test_patch_budget_auto.py`
+- `tests/test_patch_budget_preview.py`
 
 Запуск:
 
@@ -199,3 +230,5 @@ bash module_prep_data/scripts/run_prep_all.sh --config module_prep_data/prep_con
 2. `split.unit` реализован только для `by_field`.
 3. `patches_all` может не добрать target negatives из-за фильтров (`neg_dist`, `neg_mask`, `valid`).
 4. Forensic summaries в `/tmp` не являются постоянным хранилищем и могут быть очищены.
+5. `patch_budget.mode=auto` использует эвристику (не оптимизационную модель):
+   итоговые `estimated_*` значения best-effort и должны проверяться по `summary`/rejects.

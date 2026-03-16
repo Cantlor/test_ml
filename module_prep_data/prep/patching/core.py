@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-import geopandas as gpd
 import numpy as np
 import rasterio
 from rasterio.windows import Window
@@ -15,6 +14,12 @@ from .labels import (
     apply_nodata_ignore_policy,
     extent_and_boundaries_for_window,
     safe_window_centered,
+)
+from .budget import (
+    compute_patch_targets,
+    estimate_auto_patch_budget,
+    load_vector_for_budget,
+    stable_dataset_seed,
 )
 from .manifest import build_dataset_summary, build_patch_meta
 from .nodata import valid_mask_from_chip, valid_ratio_from_valid_mask
@@ -81,6 +86,64 @@ class PatchConfig:
 
     seed: int = 123
     target_patches: int = 800
+    patch_budget_mode: str = "fixed"
+    min_valid_patches_to_keep: int = 1
+    min_patches_per_dataset: int = 0
+    max_patches_per_dataset: int = 0
+    capacity_overlap_factor: float = 0.35
+    boundary_pixels_per_patch: float = 0.0
+    valid_ratio_sample_windows: int = 24
+
+
+def _shortfall_reasons(
+    *,
+    center_target: int,
+    boundary_target: int,
+    neg_target: int,
+    written_center: int,
+    written_boundary: int,
+    written_neg: int,
+    rejects: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    reasons: List[Dict[str, Any]] = []
+
+    if written_center < center_target:
+        tags: List[str] = []
+        if rejects.get("valid", 0) > 0:
+            tags.append("min_valid_ratio")
+        if rejects.get("mask", 0) > 0:
+            tags.append("mask_ratio_constraints")
+        if rejects.get("oob", 0) > 0:
+            tags.append("window_out_of_bounds")
+        if rejects.get("other", 0) > 0:
+            tags.append("geometry_sampling")
+        reasons.append({"type": "center", "reasons": tags or ["insufficient_candidates"]})
+
+    if written_boundary < boundary_target:
+        tags = []
+        if rejects.get("valid", 0) > 0:
+            tags.append("min_valid_ratio")
+        if rejects.get("mask", 0) > 0:
+            tags.append("mask_ratio_constraints")
+        if rejects.get("oob", 0) > 0:
+            tags.append("window_out_of_bounds")
+        if rejects.get("other", 0) > 0:
+            tags.append("boundary_sampling")
+        reasons.append({"type": "boundary", "reasons": tags or ["insufficient_candidates"]})
+
+    if written_neg < neg_target:
+        tags = []
+        if rejects.get("neg_dist", 0) > 0:
+            tags.append("negative_min_distance")
+        if rejects.get("neg_mask", 0) > 0:
+            tags.append("negative_mask_ratio")
+        if rejects.get("valid", 0) > 0:
+            tags.append("min_valid_ratio")
+        if rejects.get("oob", 0) > 0:
+            tags.append("window_out_of_bounds")
+        reasons.append({"type": "negative", "reasons": tags or ["insufficient_candidates"]})
+
+    return reasons
 
 
 def make_patches_for_dataset(
@@ -111,24 +174,10 @@ def make_patches_for_dataset(
     for d in [img_dir, extent_dir, extent_ig_dir, braw_dir, bwbl_dir, valid_dir, meta_dir]:
         ensure_dir(d)
 
-    gdf = gpd.read_file(str(vector_path), layer=vector_layer) if vector_layer else gpd.read_file(str(vector_path))
-    if gdf.empty:
-        raise RuntimeError("Vector is empty")
-    if gdf.crs is None:
-        raise RuntimeError("Vector CRS missing")
-
     with rasterio.open(str(raster_path)) as ds:
         if ds.crs is None:
             raise RuntimeError("Raster CRS missing")
-        raster_crs = ds.crs
-
-        gdf = gdf.to_crs(raster_crs)
-        gdf = gdf.explode(index_parts=False, ignore_index=True)
-        gdf = gdf[gdf.geometry.notnull()].copy()
-        gdf = gdf[~gdf.geometry.is_empty].copy()
-        gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
-        if gdf.empty:
-            raise RuntimeError("No polygon features left after CRS/geometry filtering")
+        gdf = load_vector_for_budget(vector_path=vector_path, raster_crs=ds.crs, vector_layer=vector_layer)
 
         try:
             sindex = gdf.sindex
@@ -138,14 +187,69 @@ def make_patches_for_dataset(
         union_geom = unary_union([g for g in gdf.geometry.values if g is not None and not g.is_empty])
         pix_m = pixel_size_m(ds)
 
-        target_total = int(cfg.target_patches)
-        neg_ratio = float(cfg.negatives_ratio)
-        pos_target = int(round(target_total * (1.0 - neg_ratio)))
-        neg_target = int(target_total - pos_target)
+        budget_mode = str(cfg.patch_budget_mode).strip().lower()
+        if budget_mode not in {"fixed", "auto"}:
+            budget_mode = "fixed"
 
-        w_sum = max(1e-9, cfg.center_weight + cfg.boundary_weight)
-        center_target = int(round(pos_target * (cfg.center_weight / w_sum)))
-        boundary_target = int(pos_target - center_target)
+        neg_ratio = float(cfg.negatives_ratio)
+        budget_info: Dict[str, Any] = {
+            "patch_size_px": int(cfg.patch_size_px),
+            "patch_budget_mode": budget_mode,
+            "estimated_total_capacity": None,
+            "estimated_center_capacity": None,
+            "estimated_boundary_capacity": None,
+            "estimated_negative_capacity": None,
+            "estimated_total_target": None,
+            "estimated_center_target": None,
+            "estimated_boundary_target": None,
+            "estimated_negative_target": None,
+            "valid_area_pixels": None,
+            "valid_area_ratio": None,
+            "field_area_pixels": None,
+            "boundary_length_pixels": None,
+            "skipped_due_to_low_capacity": False,
+            "skip_reason": None,
+        }
+
+        if budget_mode == "auto":
+            budget_info = estimate_auto_patch_budget(
+                ds=ds,
+                gdf=gdf,
+                patch_size_px=int(cfg.patch_size_px),
+                train_crop_px=int(cfg.train_crop_px),
+                negatives_ratio=float(cfg.negatives_ratio),
+                center_weight=float(cfg.center_weight),
+                boundary_weight=float(cfg.boundary_weight),
+                capacity_overlap_factor=float(cfg.capacity_overlap_factor),
+                boundary_pixels_per_patch=float(cfg.boundary_pixels_per_patch),
+                min_valid_patches_to_keep=int(cfg.min_valid_patches_to_keep),
+                min_patches_per_dataset=int(cfg.min_patches_per_dataset),
+                max_patches_per_dataset=int(cfg.max_patches_per_dataset),
+                valid_ratio_sample_windows=int(cfg.valid_ratio_sample_windows),
+                nodata_value=float(cfg.nodata_value),
+                nodata_rule=str(cfg.nodata_rule),
+                control_band_1based=int(cfg.control_band_1based),
+                seed=stable_dataset_seed(cfg.seed, ds_name),
+            )
+            target_counts = compute_patch_targets(
+                total_target=int(budget_info.get("estimated_total_target", 0)),
+                negatives_ratio=float(cfg.negatives_ratio),
+                center_weight=float(cfg.center_weight),
+                boundary_weight=float(cfg.boundary_weight),
+            )
+        else:
+            target_counts = compute_patch_targets(
+                total_target=int(cfg.target_patches),
+                negatives_ratio=float(cfg.negatives_ratio),
+                center_weight=float(cfg.center_weight),
+                boundary_weight=float(cfg.boundary_weight),
+            )
+
+        target_total = int(target_counts["target_total"])
+        pos_target = int(target_counts["pos_target"])
+        center_target = int(target_counts["center_target"])
+        boundary_target = int(target_counts["boundary_target"])
+        neg_target = int(target_counts["neg_target"])
 
         patch_w = patch_h = int(cfg.patch_size_px)
         if ds.width < patch_w or ds.height < patch_h:
@@ -164,6 +268,51 @@ def make_patches_for_dataset(
 
         manifest_rows: List[dict] = []
         rejects = {"oob": 0, "valid": 0, "mask": 0, "neg_dist": 0, "neg_mask": 0, "other": 0}
+
+        if bool(budget_info.get("skipped_due_to_low_capacity", False)):
+            summary = build_dataset_summary(
+                ds_name=ds_name,
+                raster_path=str(raster_path),
+                vector_path=str(vector_path),
+                vector_layer=vector_layer,
+                vector_id_field=vector_id_field,
+                field_id_source=field_id_source,
+                written_total=0,
+                written_center=0,
+                written_boundary=0,
+                written_negative=0,
+                target_total=int(target_total),
+                pos_target=int(pos_target),
+                center_target=int(center_target),
+                boundary_target=int(boundary_target),
+                neg_target=int(neg_target),
+                center_attempts=0,
+                boundary_attempts=0,
+                neg_attempts=0,
+                rejects=rejects,
+                nodata_value=float(cfg.nodata_value),
+                nodata_rule=str(cfg.nodata_rule),
+                control_band_1based=int(cfg.control_band_1based),
+                patch_size_px=int(cfg.patch_size_px),
+                patch_budget_mode=budget_mode,
+                budget_info=budget_info,
+                skipped_due_to_low_capacity=True,
+                skip_reason=str(budget_info.get("skip_reason") or "low_estimated_capacity"),
+                shortfall_reasons=[
+                    {
+                        "type": "dataset",
+                        "reasons": ["skipped_due_to_low_capacity"],
+                    }
+                ],
+            )
+            manifest_path = out_ds / "manifest.json"
+            write_json(manifest_path, {"summary": summary, "patches": manifest_rows})
+            if cleaned_vector_gpkg is not None:
+                try:
+                    gdf.to_file(cleaned_vector_gpkg, driver="GPKG", layer="fields_raster_crs")
+                except Exception:
+                    pass
+            return manifest_path
 
         def try_write_patch(
             patch_id: str,
@@ -438,6 +587,20 @@ def make_patches_for_dataset(
             nodata_value=float(cfg.nodata_value),
             nodata_rule=str(cfg.nodata_rule),
             control_band_1based=int(cfg.control_band_1based),
+            patch_size_px=int(cfg.patch_size_px),
+            patch_budget_mode=budget_mode,
+            budget_info=budget_info,
+            skipped_due_to_low_capacity=False,
+            skip_reason=None,
+            shortfall_reasons=_shortfall_reasons(
+                center_target=int(center_target),
+                boundary_target=int(boundary_target),
+                neg_target=int(neg_target),
+                written_center=int(written_center),
+                written_boundary=int(written_boundary),
+                written_neg=int(written_neg),
+                rejects=rejects,
+            ),
         )
 
         manifest_path = out_ds / "manifest.json"
