@@ -9,12 +9,14 @@ from rich.console import Console
 from rich.logging import RichHandler
 from tqdm import tqdm
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+MODULE_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = MODULE_ROOT.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from postprocess.io import ensure_dir, write_json
-from postprocess.pipeline import load_config, run_postprocess_pipeline
-from postprocess.search import discover_prediction_samples
+from module_postprocess_vectorize.postprocess.inputs import discover_prediction_samples
+from module_postprocess_vectorize.postprocess.io import ensure_dir, write_json
+from module_postprocess_vectorize.postprocess.pipeline import load_config, run_postprocess_pipeline
 
 
 def setup_logger(level: str) -> logging.Logger:
@@ -33,7 +35,7 @@ def main() -> int:
     ap.add_argument("--pred_root", default=None, help="Default: <run_dir>/pred")
     ap.add_argument("--output_root", default=None, help="Default: <run_dir>/postprocess")
 
-    ap.add_argument("--config", default=str(ROOT / "configs" / "postprocess_config.yaml"))
+    ap.add_argument("--config", default=str(MODULE_ROOT / "configs" / "postprocess_config.yaml"))
     ap.add_argument("--params_override", default=None, help="Optional YAML with tuned params")
 
     ap.add_argument("--extent_name", default=None)
@@ -78,6 +80,7 @@ def main() -> int:
         "pred_root": str(pred_root),
         "output_root": str(output_root),
         "num_samples": len(samples),
+        "config_path": str(Path(args.config).resolve()),
         "samples": [],
     }
 
@@ -89,6 +92,10 @@ def main() -> int:
                 boundary_prob_path=sample.boundary_prob_path,
                 valid_mask_path=sample.valid_mask_path,
                 footprint_path=sample.footprint_path,
+                footprint_nodata_value=sample.valid_nodata_value,
+                footprint_nodata_rule=sample.valid_nodata_rule,
+                footprint_control_band_1based=sample.valid_control_band_1based,
+                input_context=sample.to_input_context(),
                 output_dir=out_dir,
                 config=cfg,
                 save_outputs=True,
@@ -102,8 +109,13 @@ def main() -> int:
                     "boundary_prob": str(sample.boundary_prob_path),
                     "valid_mask": str(sample.valid_mask_path) if sample.valid_mask_path else None,
                     "footprint": str(sample.footprint_path) if sample.footprint_path else None,
+                    "predict_manifest": str(sample.predict_manifest_path) if sample.predict_manifest_path else None,
+                    "config_used": str(sample.config_used_path) if sample.config_used_path else None,
+                    "valid_source": res.get("valid_source"),
+                    "valid_context": res.get("valid_context"),
                     "output_dir": str(out_dir),
                     "labels_stats": res.get("labels_stats"),
+                    "postprocess_manifest": res.get("postprocess_manifest_json"),
                 }
             )
         except Exception as exc:

@@ -32,8 +32,19 @@ sobel_weight: 0.2
 
 # Memory safety guard-rails for large AOI rasters.
 memory:
+  # Input probability dtype at load time.
   prob_dtype: float16
-  smooth_dtype: float16
+  # auto -> float32 on safe scenes, float16 under RAM pressure.
+  smooth_dtype: auto
+  smooth_dtype_large: float16
+  # Conservative RAM-aware planner for portable behavior across machines.
+  ram_budget_fraction: 0.30
+  ram_guard_mb: 1024
+  min_ram_budget_mb: 768
+  degrade_gaussian_pressure: 0.70
+  disable_gaussian_pressure: 1.15
+  disable_watershed_pressure: 0.95
+  switch_fast_clean_pressure: 0.85
   auto_disable_watershed: true
   force_no_watershed: false
   max_pixels_for_watershed: 50000000
@@ -41,6 +52,10 @@ memory:
   auto_disable_gaussian_large: true
   max_pixels_for_gaussian: 50000000
   sobel_weight_large: 0.0
+  clean_labels_mode: auto
+  clean_labels_fast_pixels_threshold: 40000000
+  clean_labels_max_exact_hole_labels: 512
+  clean_labels_max_exact_merge_regions: 2048
 
 # Final geometry cleanup
 remove_holes: true
@@ -62,6 +77,13 @@ scoring:
 
 # Search space for scripts/01_search_postprocess_params.py
 search:
+  strategy:
+    # coarse_to_fine avoids brute-force explosion on large grids.
+    mode: coarse_to_fine   # coarse_to_fine | grid
+    max_trials_auto: 256
+    coarse_trials: 96
+    coarse_top_k: 3
+    refine_neighbor_span: 1
   grid:
     extent_thr: [0.45, 0.50, 0.55]
     boundary_thr: [0.35, 0.45, 0.55]

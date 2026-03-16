@@ -8,11 +8,13 @@ from pathlib import Path
 from rich.console import Console
 from rich.logging import RichHandler
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+MODULE_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = MODULE_ROOT.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from postprocess.pipeline import load_config
-from postprocess.search import run_grid_search
+from module_postprocess_vectorize.postprocess.pipeline import load_config
+from module_postprocess_vectorize.postprocess.search import run_grid_search
 
 
 def setup_logger(level: str) -> logging.Logger:
@@ -29,7 +31,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Grid search for post-processing parameters on validation predictions")
     ap.add_argument("--pred_root", required=True, help="Root directory with predicted rasters")
     ap.add_argument("--gt_root", required=True, help="GT polygons directory/file OR GT label raster directory/file")
-    ap.add_argument("--config", default=str(ROOT / "configs" / "postprocess_config.yaml"))
+    ap.add_argument("--config", default=str(MODULE_ROOT / "configs" / "postprocess_config.yaml"))
     ap.add_argument("--params_override", default=None, help="Optional YAML with config overrides")
     ap.add_argument("--output_dir", required=True, help="Where to save best_params.yaml + search_results.json")
     ap.add_argument("--gt_mode", default="auto", choices=["auto", "vector", "raster"])

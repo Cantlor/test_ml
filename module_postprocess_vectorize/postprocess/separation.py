@@ -83,7 +83,26 @@ def _fill_small_holes_per_label(labels: np.ndarray, max_hole_area_px: int) -> np
     return out
 
 
-def _merge_small_regions(labels: np.ndarray, max_area_px: int) -> np.ndarray:
+def _fill_small_holes_fast(labels: np.ndarray, max_hole_area_px: int) -> np.ndarray:
+    if max_hole_area_px <= 0:
+        return labels
+    fg = labels > 0
+    if not np.any(fg):
+        return labels
+
+    filled = _remove_small_holes(fg, area_threshold=int(max_hole_area_px))
+    add = filled & (~fg)
+    if not np.any(add):
+        return labels
+
+    out = labels.copy()
+    _, (iy, ix) = ndi.distance_transform_edt(~fg, return_indices=True)
+    nearest = out[iy[add], ix[add]]
+    out[add] = nearest.astype(np.int32, copy=False)
+    return out
+
+
+def _merge_small_regions(labels: np.ndarray, max_area_px: int, mode: str, max_exact_regions: int) -> np.ndarray:
     if max_area_px <= 0:
         return labels
 
@@ -93,6 +112,16 @@ def _merge_small_regions(labels: np.ndarray, max_area_px: int) -> np.ndarray:
     small = small[small > 0]
 
     if small.size == 0:
+        return out
+
+    if mode == "fast" or (mode != "exact" and small.size > int(max_exact_regions)):
+        small_mask = np.isin(out, small, assume_unique=False)
+        keep_mask = (out > 0) & (~small_mask)
+        if not np.any(keep_mask):
+            out[small_mask] = 0
+            return out
+        _, (iy, ix) = ndi.distance_transform_edt(~keep_mask, return_indices=True)
+        out[small_mask] = out[iy[small_mask], ix[small_mask]]
         return out
 
     # Small-first strategy to reduce fragmented islands.
@@ -143,6 +172,9 @@ def clean_labels(
     fill_holes_max_area_px: int,
     small_region_max_area_px: int,
     valid_mask: np.ndarray,
+    mode: str = "auto",
+    max_exact_hole_labels: int = 512,
+    max_exact_merge_regions: int = 2048,
 ) -> np.ndarray:
     """
     Clean raster labels:
@@ -154,8 +186,25 @@ def clean_labels(
     out = labels.astype(np.int32, copy=True)
     out[~valid_mask.astype(bool)] = 0
 
-    out = _fill_small_holes_per_label(out, int(fill_holes_max_area_px))
-    out = _merge_small_regions(out, int(small_region_max_area_px))
+    mode = str(mode or "auto").strip().lower()
+    if mode not in {"auto", "exact", "fast"}:
+        mode = "auto"
+
+    uniq = np.unique(out)
+    uniq = uniq[uniq > 0]
+    hole_mode = mode
+    if mode == "auto":
+        hole_mode = "exact" if uniq.size <= int(max_exact_hole_labels) else "fast"
+
+    if hole_mode == "fast":
+        out = _fill_small_holes_fast(out, int(fill_holes_max_area_px))
+    else:
+        out = _fill_small_holes_per_label(out, int(fill_holes_max_area_px))
+
+    merge_mode = mode
+    if mode == "auto":
+        merge_mode = "exact"
+    out = _merge_small_regions(out, int(small_region_max_area_px), mode=merge_mode, max_exact_regions=int(max_exact_merge_regions))
     out = _drop_tiny_regions(out, int(min_region_area_px))
 
     out[~valid_mask.astype(bool)] = 0

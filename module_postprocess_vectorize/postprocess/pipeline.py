@@ -4,8 +4,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
+import geopandas as gpd
 import numpy as np
-import rasterio
 
 from .geometry_clean import clean_polygons
 from .io import deep_update, ensure_dir, load_inputs, read_yaml, save_raster, to_serializable, write_json
@@ -18,6 +18,7 @@ from .raster_ops import (
     log_thresholds,
     smooth_probabilities,
 )
+from .runtime import build_runtime_policy
 from .seeds import build_markers
 from .separation import clean_labels, labels_stats, split_fields
 from .vectorize import (
@@ -59,6 +60,10 @@ def _get_int(cfg: Mapping[str, Any], key: str, default: int) -> int:
         return int(default)
 
 
+def _empty_prediction_gdf(crs) -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame({"label_id": [], "geometry": []}, geometry="geometry", crs=crs)
+
+
 def run_postprocess_pipeline(
     *,
     extent_prob_path: Path,
@@ -67,6 +72,10 @@ def run_postprocess_pipeline(
     config: Mapping[str, Any],
     valid_mask_path: Optional[Path] = None,
     footprint_path: Optional[Path] = None,
+    footprint_nodata_value: Optional[float] = None,
+    footprint_nodata_rule: str = "control-band",
+    footprint_control_band_1based: int = 1,
+    input_context: Optional[Mapping[str, Any]] = None,
     gt_path: Optional[Path] = None,
     save_outputs: bool = True,
     logger: Optional[logging.Logger] = None,
@@ -76,31 +85,28 @@ def run_postprocess_pipeline(
 
     memory_cfg = dict(config.get("memory", {}) or {})
     prob_dtype = str(memory_cfg.get("prob_dtype", "float16"))
-    auto_disable_watershed = bool(memory_cfg.get("auto_disable_watershed", True))
-    force_no_watershed = bool(memory_cfg.get("force_no_watershed", False))
-    max_pixels_for_watershed = int(memory_cfg.get("max_pixels_for_watershed", 50_000_000))
-    warn_pixels_threshold = int(memory_cfg.get("warn_pixels_threshold", 30_000_000))
-    auto_disable_gaussian_large = bool(memory_cfg.get("auto_disable_gaussian_large", True))
-    max_pixels_for_gaussian = int(memory_cfg.get("max_pixels_for_gaussian", max_pixels_for_watershed))
-    sobel_weight_default = _get_float(config, "sobel_weight", 0.0)
-    sobel_weight_large = _get_float(memory_cfg, "sobel_weight_large", 0.0)
-
-    with rasterio.open(extent_prob_path) as ref_ds:
-        n_pixels = int(ref_ds.width) * int(ref_ds.height)
-    if n_pixels >= warn_pixels_threshold:
-        log.warning(
-            "Large raster detected: %d pixels (%.2f MP). Using memory-safe settings where needed.",
-            n_pixels,
-            n_pixels / 1_000_000.0,
-        )
 
     bundle = load_inputs(
         extent_prob_path=extent_prob_path,
         boundary_prob_path=boundary_prob_path,
         valid_mask_path=valid_mask_path,
         footprint_path=footprint_path,
+        footprint_nodata_value=footprint_nodata_value,
+        footprint_nodata_rule=footprint_nodata_rule,
+        footprint_control_band_1based=footprint_control_band_1based,
         prob_dtype=prob_dtype,
     )
+    n_pixels = int(bundle.meta.width) * int(bundle.meta.height)
+    valid_pixels = int(bundle.valid_mask.sum())
+
+    runtime = build_runtime_policy(
+        config=config,
+        memory_cfg=memory_cfg,
+        n_pixels=n_pixels,
+        valid_pixels=valid_pixels,
+    )
+    for warn in runtime.warnings:
+        log.warning("Runtime policy: %s", warn)
 
     pixel_area_m2 = estimate_pixel_area_m2(
         crs=bundle.meta.crs,
@@ -111,15 +117,7 @@ def run_postprocess_pipeline(
 
     extent_thr = _get_float(config, "extent_thr", 0.5)
     boundary_thr = _get_float(config, "boundary_thr", 0.5)
-    gaussian_sigma_px = _get_float(config, "gaussian_sigma_px", 1.0)
-    if auto_disable_gaussian_large and (n_pixels > max_pixels_for_gaussian):
-        if gaussian_sigma_px > 0:
-            log.warning(
-                "Gaussian smoothing disabled by memory safety: pixels=%d > max_pixels_for_gaussian=%d",
-                n_pixels,
-                max_pixels_for_gaussian,
-            )
-        gaussian_sigma_px = 0.0
+    gaussian_sigma_px = float(runtime.gaussian_sigma_px_effective)
     boundary_dilate_px = _get_int(config, "boundary_dilate_px", 1)
 
     fill_holes_max_area_m2 = _get_float(config, "fill_holes_max_area_m2", 50.0)
@@ -133,23 +131,13 @@ def run_postprocess_pipeline(
     seed_min_distance_px = _get_int(config, "seed_min_distance_px", 6)
     seed_hmax = _get_float(config, "seed_hmax", 1.0)
     marker_erode_px = _get_int(config, "marker_erode_px", 1)
-    use_watershed_cfg = bool(config.get("use_watershed", True))
     boundary_weight = _get_float(config, "boundary_weight", 2.5)
-
-    disable_watershed_large = auto_disable_watershed and (n_pixels > max_pixels_for_watershed)
-    use_watershed = bool(use_watershed_cfg and not force_no_watershed and not disable_watershed_large)
-    if use_watershed_cfg and not use_watershed:
-        log.warning(
-            "Watershed disabled by memory safety: pixels=%d > max_pixels_for_watershed=%d",
-            n_pixels,
-            max_pixels_for_watershed,
-        )
-
-    sobel_weight = float(sobel_weight_default)
-    if disable_watershed_large:
-        sobel_weight = float(sobel_weight_large)
-
-    smooth_dtype = str(memory_cfg.get("smooth_dtype", prob_dtype if disable_watershed_large else "float32"))
+    use_watershed = bool(runtime.use_watershed)
+    sobel_weight = float(runtime.sobel_weight_effective)
+    smooth_dtype = str(runtime.smooth_dtype)
+    clean_labels_mode = str(runtime.clean_labels_mode)
+    clean_labels_max_exact_hole_labels = _get_int(memory_cfg, "clean_labels_max_exact_hole_labels", 512)
+    clean_labels_max_exact_merge_regions = _get_int(memory_cfg, "clean_labels_max_exact_merge_regions", 2048)
 
     simplify_m = _get_float(config, "simplify_m", 1.0)
     remove_holes = bool(config.get("remove_holes", True))
@@ -169,66 +157,104 @@ def run_postprocess_pipeline(
         remove_small_objects_m2=remove_small_objects_m2,
     )
 
-    extent_smooth, boundary_smooth = smooth_probabilities(
-        extent_prob=bundle.extent_prob,
-        boundary_prob=bundle.boundary_prob,
-        sigma_px=gaussian_sigma_px,
-        valid_mask=bundle.valid_mask,
-        output_dtype=smooth_dtype,
-    )
+    early_exit_reason: Optional[str] = None
 
-    field_mask = build_field_mask(
-        extent_smooth=extent_smooth,
-        valid_mask=bundle.valid_mask,
-        extent_thr=extent_thr,
-        remove_small_objects_px=remove_small_objects_px,
-        fill_holes_px=fill_holes_px,
-        opening_px=opening_px,
-        closing_px=closing_px,
-    )
-
-    boundary_barrier = build_boundary_barrier(
-        boundary_smooth=boundary_smooth,
-        valid_mask=bundle.valid_mask,
-        boundary_thr=boundary_thr,
-        boundary_dilate_px=boundary_dilate_px,
-    )
-
-    if use_watershed:
-        seeds, _distance = build_markers(
-            field_mask=field_mask,
-            boundary_barrier=boundary_barrier,
-            seed_min_distance_px=seed_min_distance_px,
-            seed_hmax=seed_hmax,
-            marker_erode_px=marker_erode_px,
-        )
-        split_mask = field_mask
+    if valid_pixels <= 0:
+        extent_smooth = bundle.extent_prob.astype(np.dtype(smooth_dtype), copy=False)
+        boundary_smooth = bundle.boundary_prob.astype(np.dtype(smooth_dtype), copy=False)
+        field_mask = np.zeros((bundle.meta.height, bundle.meta.width), dtype=bool)
+        boundary_barrier = np.zeros((bundle.meta.height, bundle.meta.width), dtype=bool)
+        seeds = np.zeros((bundle.meta.height, bundle.meta.width), dtype=np.int32)
+        labels = np.zeros((bundle.meta.height, bundle.meta.width), dtype=np.int32)
+        labels_stats_obj = {"num_labels": 0, "max_label": 0, "num_pixels_fg": 0}
+        raw_gdf = _empty_prediction_gdf(bundle.meta.crs)
+        early_exit_reason = "all_invalid"
+    elif float(bundle.extent_prob.max()) < float(extent_thr):
+        extent_smooth = bundle.extent_prob.astype(np.dtype(smooth_dtype), copy=False)
+        boundary_smooth = bundle.boundary_prob.astype(np.dtype(smooth_dtype), copy=False)
+        field_mask = np.zeros((bundle.meta.height, bundle.meta.width), dtype=bool)
+        boundary_barrier = np.zeros((bundle.meta.height, bundle.meta.width), dtype=bool)
+        seeds = np.zeros((bundle.meta.height, bundle.meta.width), dtype=np.int32)
+        labels = np.zeros((bundle.meta.height, bundle.meta.width), dtype=np.int32)
+        labels_stats_obj = {"num_labels": 0, "max_label": 0, "num_pixels_fg": 0}
+        raw_gdf = _empty_prediction_gdf(bundle.meta.crs)
+        early_exit_reason = "no_extent_above_threshold"
     else:
-        seeds = np.zeros(field_mask.shape, dtype=np.int32)
-        # For no-watershed fallback, enforce boundary split directly in binary mask.
-        split_mask = field_mask & (~boundary_barrier)
+        extent_smooth, boundary_smooth = smooth_probabilities(
+            extent_prob=bundle.extent_prob,
+            boundary_prob=bundle.boundary_prob,
+            sigma_px=gaussian_sigma_px,
+            valid_mask=bundle.valid_mask,
+            output_dtype=smooth_dtype,
+        )
 
-    labels_raw = split_fields(
-        field_mask=split_mask,
-        extent_smooth=extent_smooth,
-        boundary_smooth=boundary_smooth,
-        markers=seeds,
-        use_watershed=use_watershed,
-        boundary_weight=boundary_weight,
-        sobel_weight=sobel_weight,
-    )
+        field_mask = build_field_mask(
+            extent_smooth=extent_smooth,
+            valid_mask=bundle.valid_mask,
+            extent_thr=extent_thr,
+            remove_small_objects_px=remove_small_objects_px,
+            fill_holes_px=fill_holes_px,
+            opening_px=opening_px,
+            closing_px=closing_px,
+        )
+        if not np.any(field_mask):
+            boundary_barrier = np.zeros(field_mask.shape, dtype=bool)
+            seeds = np.zeros(field_mask.shape, dtype=np.int32)
+            labels = np.zeros(field_mask.shape, dtype=np.int32)
+            labels_stats_obj = {"num_labels": 0, "max_label": 0, "num_pixels_fg": 0}
+            raw_gdf = _empty_prediction_gdf(bundle.meta.crs)
+            early_exit_reason = "empty_field_mask"
+        else:
+            boundary_barrier = build_boundary_barrier(
+                boundary_smooth=boundary_smooth,
+                valid_mask=bundle.valid_mask,
+                boundary_thr=boundary_thr,
+                boundary_dilate_px=boundary_dilate_px,
+            )
 
-    labels = clean_labels(
-        labels=labels_raw,
-        min_region_area_px=min_region_px,
-        fill_holes_max_area_px=fill_holes_px,
-        small_region_max_area_px=small_region_px,
-        valid_mask=bundle.valid_mask,
-    )
+            if use_watershed:
+                seeds, _distance = build_markers(
+                    field_mask=field_mask,
+                    boundary_barrier=boundary_barrier,
+                    seed_min_distance_px=seed_min_distance_px,
+                    seed_hmax=seed_hmax,
+                    marker_erode_px=marker_erode_px,
+                )
+                split_mask = field_mask
+            else:
+                seeds = np.zeros(field_mask.shape, dtype=np.int32)
+                # For no-watershed fallback, enforce boundary split directly in binary mask.
+                split_mask = field_mask & (~boundary_barrier)
 
-    raw_gdf = labels_to_geodataframe(labels=labels, transform=bundle.meta.transform, crs=bundle.meta.crs)
+            labels_raw = split_fields(
+                field_mask=split_mask,
+                extent_smooth=extent_smooth,
+                boundary_smooth=boundary_smooth,
+                markers=seeds,
+                use_watershed=use_watershed,
+                boundary_weight=boundary_weight,
+                sobel_weight=sobel_weight,
+            )
 
-    valid_geom = valid_mask_to_geometry(valid_mask=bundle.valid_mask, transform=bundle.meta.transform)
+            labels = clean_labels(
+                labels=labels_raw,
+                min_region_area_px=min_region_px,
+                fill_holes_max_area_px=fill_holes_px,
+                small_region_max_area_px=small_region_px,
+                valid_mask=bundle.valid_mask,
+                mode=clean_labels_mode,
+                max_exact_hole_labels=clean_labels_max_exact_hole_labels,
+                max_exact_merge_regions=clean_labels_max_exact_merge_regions,
+            )
+            labels_stats_obj = labels_stats(labels)
+            raw_gdf = labels_to_geodataframe(labels=labels, transform=bundle.meta.transform, crs=bundle.meta.crs)
+
+    if early_exit_reason is not None:
+        use_watershed = False
+
+    valid_geom = None
+    if clip_to_valid and valid_pixels > 0 and valid_pixels < n_pixels:
+        valid_geom = valid_mask_to_geometry(valid_mask=bundle.valid_mask, transform=bundle.meta.transform)
     if clip_to_valid and valid_geom is not None and not raw_gdf.empty:
         raw_gdf = clip_geodataframe_to_geom(raw_gdf, valid_geom)
 
@@ -237,7 +263,7 @@ def run_postprocess_pipeline(
         min_area_m2=min_area_m2,
         simplify_m=simplify_m,
         remove_holes=remove_holes,
-        clip_geom=valid_geom if clip_to_valid else None,
+        clip_geom=None,
         straighten_cfg=straighten_cfg,
     )
 
@@ -249,19 +275,26 @@ def run_postprocess_pipeline(
 
     outputs: Dict[str, Any] = {
         "pixel_area_m2": pixel_area_m2,
-        "labels_stats": labels_stats(labels),
+        "labels_stats": labels_stats_obj,
         "fields_pred_raw": raw_gdf,
         "fields_pred": final_gdf,
         "metrics_postproc": metrics_postproc,
-        "memory_runtime": {
-            "n_pixels": n_pixels,
-            "prob_dtype": prob_dtype,
-            "smooth_dtype": smooth_dtype,
-            "gaussian_sigma_px_effective": gaussian_sigma_px,
-            "use_watershed_effective": use_watershed,
-            "max_pixels_for_watershed": max_pixels_for_watershed,
-            "max_pixels_for_gaussian": max_pixels_for_gaussian,
-        },
+        "valid_source": bundle.valid_source,
+        "valid_context": bundle.valid_context,
+        "memory_runtime": deep_update(
+            runtime.to_dict(),
+            {
+                "n_pixels": n_pixels,
+                "valid_pixels": valid_pixels,
+                "valid_fraction": (float(valid_pixels) / float(max(1, n_pixels))),
+                "prob_dtype": prob_dtype,
+                "smooth_dtype": smooth_dtype,
+                "gaussian_sigma_px_effective": gaussian_sigma_px,
+                "use_watershed_effective": use_watershed,
+                "clean_labels_mode": clean_labels_mode,
+                "early_exit_reason": early_exit_reason,
+            },
+        ),
     }
 
     if save_outputs:
@@ -313,9 +346,12 @@ def run_postprocess_pipeline(
                 "boundary_prob_path": str(boundary_prob_path.resolve()),
                 "valid_mask_path": str(valid_mask_path.resolve()) if valid_mask_path is not None else None,
                 "footprint_path": str(footprint_path.resolve()) if footprint_path is not None else None,
+                "valid_source": bundle.valid_source,
+                "valid_context": to_serializable(bundle.valid_context),
+                "input_context": to_serializable(dict(input_context or {})),
                 "pixel_area_m2": pixel_area_m2,
                 "config": to_serializable(dict(config)),
-                "labels_stats": labels_stats(labels),
+                "labels_stats": labels_stats_obj,
                 "memory_runtime": to_serializable(outputs["memory_runtime"]),
             },
         )
@@ -323,5 +359,32 @@ def run_postprocess_pipeline(
         if metrics_postproc is not None:
             write_json(out_dir / "metrics_postproc.json", metrics_postproc)
             outputs["metrics_postproc_json"] = str(out_dir / "metrics_postproc.json")
+
+        manifest_outputs = {
+            key: value
+            for key, value in outputs.items()
+            if isinstance(value, str) and key.endswith(("_tif", "_gpkg", "_shp", "_json"))
+        }
+        postprocess_manifest_path = out_dir / "postprocess_manifest.json"
+        write_json(
+            postprocess_manifest_path,
+            {
+                "schema_version": "1.0",
+                "extent_prob_path": str(extent_prob_path.resolve()),
+                "boundary_prob_path": str(boundary_prob_path.resolve()),
+                "valid_mask_path": str(valid_mask_path.resolve()) if valid_mask_path is not None else None,
+                "footprint_path": str(footprint_path.resolve()) if footprint_path is not None else None,
+                "valid_source": bundle.valid_source,
+                "valid_context": to_serializable(bundle.valid_context),
+                "input_context": to_serializable(dict(input_context or {})),
+                "labels_stats": labels_stats_obj,
+                "pixel_area_m2": pixel_area_m2,
+                "memory_runtime": to_serializable(outputs["memory_runtime"]),
+                "config": to_serializable(dict(config)),
+                "outputs": manifest_outputs,
+                "metrics_postproc": to_serializable(metrics_postproc),
+            },
+        )
+        outputs["postprocess_manifest_json"] = str(postprocess_manifest_path)
 
     return outputs

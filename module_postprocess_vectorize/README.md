@@ -37,7 +37,8 @@ module_postprocess_vectorize/
 - `extent_prob.tif` (float32, probability поля)
 - `boundary_prob.tif` (float32, probability границы)
 - опционально `valid_mask.tif` (1=valid, 0=invalid)
-- опционально `footprint` (если нужно ограничить область)
+- опционально `predict_manifest.json`
+- опционально AOI raster (`aoi_raster` из `predict_manifest.json`)
 
 Контроль входов:
 - одинаковые `width/height`
@@ -46,8 +47,15 @@ module_postprocess_vectorize/
 - проверка/нормализация probability в диапазон `[0, 1]`
 
 Интеграция с `module_net_train`:
-- для batch-режима ожидается структура `output_data/module_net_train/runs/<timestamp_run>/pred/<dataset_key>/...`;
-- если `valid_mask.tif` отсутствует, модуль пытается взять footprint из `predict_manifest.json` (`aoi_raster`) и не выпускать полигоны за AOI.
+- для batch-режима ожидается структура `output_data/module_net_train/runs/<run_id>/pred/<dataset_key>/...`;
+- current `predict_manifest.json` из `module_net_train` уже содержит:
+  - `extent_prob`
+  - `boundary_prob`
+  - `aoi_raster`
+  - `config_used`
+- если `valid_mask.tif` отсутствует, модуль использует `aoi_raster` и строит valid-mask по current nodata-policy из `config_used`;
+- если `config_used` недоступен, берётся nodata metadata самого AOI raster;
+- только если nodata вообще не определён, используется последний fallback `> 0`.
 
 ## Выходы
 
@@ -66,19 +74,20 @@ module_postprocess_vectorize/
 
 Служебные артефакты:
 - `params_used.json`
+- `postprocess_manifest.json`
 - `metrics_postproc.json` (если передан GT)
 - `search_results.json` + `best_params.yaml` (для search)
 
 ## Алгоритм пайплайна
 
 1. Валидация и загрузка co-registered входных raster.
-2. Маскирование по `valid_mask` (вне valid всегда фон).
+2. Маскирование по `valid_mask` или valid-context, восстановленному из `predict_manifest.json`/AOI raster (вне valid всегда фон).
 3. Лёгкое Gaussian сглаживание вероятностей.
 4. `field_mask` из extent threshold + морфологическая очистка.
 5. `boundary_barrier` из boundary threshold + optional dilation.
 6. Seeds/markers: distance transform + local maxima/h-maxima.
 7. Разделение полей: marker-based watershed внутри `field_mask` с учётом boundary-барьера.
-   Для больших AOI автоматически включается memory-safe fallback (watershed выключается по порогу пикселей).
+   Для больших AOI включается RAM-aware fallback (graceful: сначала смягчение параметров, при высокой нагрузке отключение watershed).
 8. Очистка `labels`: fill small holes, merge small regions, drop tiny leftovers, relabel.
 9. Векторизация labels в CRS входа.
 10. Геометрическая очистка: `make_valid`, remove holes, min area в m², simplify в метрах, optional straighten, clip к valid area.
@@ -113,6 +122,9 @@ module_postprocess_vectorize/
 - `memory.auto_disable_gaussian_large`
 - `memory.max_pixels_for_gaussian`
 - `memory.sobel_weight_large`
+- `memory.ram_budget_fraction`, `memory.ram_guard_mb`, `memory.min_ram_budget_mb`
+- `memory.degrade_gaussian_pressure`, `memory.disable_watershed_pressure`
+- `memory.clean_labels_mode`, `memory.clean_labels_fast_pixels_threshold`
 
 ## CLI
 
@@ -120,7 +132,7 @@ module_postprocess_vectorize/
 
 ```bash
 ./.venv/bin/python module_postprocess_vectorize/scripts/01_search_postprocess_params.py \
-  --pred_root output_data/module_net_train/runs/20260312_131232/pred \
+  --pred_root output_data/module_net_train/runs/20260313_112627/pred \
   --gt_root <path_to_gt_vectors_or_gt_label_rasters> \
   --config module_postprocess_vectorize/configs/postprocess_config.yaml \
   --output_dir output_data/module_postprocess_vectorize/search/<search_id>
@@ -134,19 +146,20 @@ module_postprocess_vectorize/
 
 ```bash
 ./.venv/bin/python module_postprocess_vectorize/scripts/02_postprocess_single.py \
-  --extent_prob <.../extent_prob.tif> \
-  --boundary_prob <.../boundary_prob.tif> \
-  --valid_mask <.../valid_mask.tif> \
+  --predict_manifest output_data/module_net_train/runs/20260313_112627/pred/first_raster/predict_manifest.json \
   --config module_postprocess_vectorize/configs/postprocess_config.yaml \
-  --params_override output_data/module_postprocess_vectorize/search/<search_id>/best_params.yaml \
   --output_dir output_data/module_postprocess_vectorize/single/<sample_id>
 ```
+
+Также поддерживаются режимы:
+- явная пара `--extent_prob` + `--boundary_prob`
+- `--run_dir output_data/module_net_train/runs/<run_id> --dataset_key first_raster`
 
 ### 3) Пакетная постобработка run_dir
 
 ```bash
 ./.venv/bin/python module_postprocess_vectorize/scripts/03_postprocess_run.py \
-  --run_dir output_data/module_net_train/runs/20260312_131232 \
+  --run_dir output_data/module_net_train/runs/20260313_112627 \
   --config module_postprocess_vectorize/configs/postprocess_config.yaml \
   --params_override output_data/module_postprocess_vectorize/search/<search_id>/best_params.yaml
 ```
@@ -154,18 +167,20 @@ module_postprocess_vectorize/
 По умолчанию:
 - вход: `<run_dir>/pred/**/extent_prob.tif`, `boundary_prob.tif`
 - выход: `<run_dir>/postprocess/<sample_id>/...`
+- для каждого sample дополнительно пишется `postprocess_manifest.json` с входами, valid-source, valid-context и outputs.
 
 Memory-safe поведение:
 - для крупных raster модуль автоматически снижает память (`prob_dtype=float16`);
-- при превышении `memory.max_pixels_for_gaussian` отключает Gaussian blur;
-- при превышении `memory.max_pixels_for_watershed` переключает разделение в safer-mode без watershed;
-- это предотвращает OOM на больших AOI ценой более консервативного instance split.
+- RAM-aware planner оценивает доступную память и размер сцены перед тяжёлыми стадиями;
+- Gaussian fallback теперь staged: сначала уменьшение `sigma`, полное отключение только при высокой memory pressure;
+- watershed отключается только при hard-guard (`max_pixels_*`) или при оценке риска OOM;
+- `clean_labels` автоматически переключается в fast-mode на больших сценах.
 
 ### 5) Один shell-скрипт для запуска модуля целиком
 
 ```bash
 ./module_postprocess_vectorize/scripts/run_postprocess_all.sh \
-  --run_dir output_data/module_net_train/runs/20260312_131232 \
+  --run_dir output_data/module_net_train/runs/20260313_112627 \
   --gt_root <path_to_gt_vectors_or_gt_rasters> \
   --gt_mode vector
 ```

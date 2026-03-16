@@ -35,6 +35,8 @@ class InputRasters:
     boundary_prob: np.ndarray
     valid_mask: np.ndarray
     meta: RasterMeta
+    valid_source: str
+    valid_context: Dict[str, Any]
 
 
 def ensure_dir(path: Path) -> Path:
@@ -128,6 +130,63 @@ def _read_single_band(path: Path, out_dtype: Optional[str] = None) -> tuple[np.n
     return arr, meta
 
 
+def _load_valid_mask_from_footprint(
+    path: Path,
+    *,
+    nodata_value: Optional[float],
+    nodata_rule: str,
+    control_band_1based: int,
+) -> tuple[np.ndarray, RasterMeta, str, Dict[str, Any]]:
+    with rasterio.open(path) as ds:
+        if ds.count < 1:
+            raise ValueError(f"{path}: raster has no bands")
+        if ds.crs is None:
+            raise ValueError(f"{path}: CRS is missing")
+
+        effective_nodata = nodata_value
+        if effective_nodata is None and ds.nodata is not None:
+            effective_nodata = float(ds.nodata)
+
+        if effective_nodata is None:
+            mask_arr = ds.read(1, out_dtype="float32")
+            valid_mask = (mask_arr > 0).astype(np.uint8)
+            valid_source = "footprint_nonzero_fallback"
+            resolved_rule = "nonzero"
+        else:
+            rule = str(nodata_rule or "control-band").strip().lower()
+            if rule == "all-bands":
+                valid_bool = np.ones((int(ds.height), int(ds.width)), dtype=bool)
+                for band_idx in range(1, int(ds.count) + 1):
+                    band_arr = ds.read(band_idx)
+                    valid_bool &= band_arr != effective_nodata
+            else:
+                band_idx = max(1, min(int(ds.count), int(control_band_1based)))
+                band_arr = ds.read(band_idx)
+                valid_bool = band_arr != effective_nodata
+                rule = "control-band"
+                control_band_1based = band_idx
+            valid_mask = valid_bool.astype(np.uint8)
+            valid_source = "footprint_nodata"
+            resolved_rule = rule
+
+        profile = ds.profile.copy()
+        meta = RasterMeta(
+            width=int(ds.width),
+            height=int(ds.height),
+            transform=ds.transform,
+            crs=ds.crs,
+            profile=profile,
+        )
+
+    valid_context = {
+        "path": str(path.resolve()),
+        "nodata_value": effective_nodata,
+        "nodata_rule": resolved_rule,
+        "control_band_1based": int(control_band_1based),
+    }
+    return valid_mask, meta, valid_source, valid_context
+
+
 def _assert_aligned(base: RasterMeta, other: RasterMeta, base_name: str, other_name: str) -> None:
     if base.width != other.width or base.height != other.height:
         raise ValueError(
@@ -144,6 +203,9 @@ def load_inputs(
     boundary_prob_path: Path,
     valid_mask_path: Optional[Path] = None,
     footprint_path: Optional[Path] = None,
+    footprint_nodata_value: Optional[float] = None,
+    footprint_nodata_rule: str = "control-band",
+    footprint_control_band_1based: int = 1,
     prob_dtype: str = "float32",
 ) -> InputRasters:
     """
@@ -167,13 +229,27 @@ def load_inputs(
     boundary_prob = _to_float_probability(boundary_raw, "boundary_prob", target_dtype=np_prob_dtype)
 
     valid_mask: np.ndarray
-    mask_source = valid_mask_path or footprint_path
-    if mask_source is not None:
-        mask_arr, mask_meta = _read_single_band(Path(mask_source).resolve(), out_dtype="uint8")
+    valid_source = "all_valid"
+    valid_context: Dict[str, Any] = {}
+    if valid_mask_path is not None:
+        mask_arr, mask_meta = _read_single_band(Path(valid_mask_path).resolve(), out_dtype="uint8")
         _assert_aligned(extent_meta, mask_meta, "extent_prob", "valid_mask")
         valid_mask = (mask_arr > 0).astype(np.uint8)
+        valid_source = "valid_mask"
+        valid_context = {
+            "path": str(Path(valid_mask_path).resolve()),
+        }
+    elif footprint_path is not None:
+        valid_mask, mask_meta, valid_source, valid_context = _load_valid_mask_from_footprint(
+            Path(footprint_path).resolve(),
+            nodata_value=footprint_nodata_value,
+            nodata_rule=footprint_nodata_rule,
+            control_band_1based=footprint_control_band_1based,
+        )
+        _assert_aligned(extent_meta, mask_meta, "extent_prob", "footprint")
     else:
         valid_mask = np.ones_like(extent_prob, dtype=np.uint8)
+        valid_context = {"mode": "all_valid"}
 
     # Hard background outside valid area.
     inv = valid_mask == 0
@@ -185,6 +261,8 @@ def load_inputs(
         boundary_prob=boundary_prob,
         valid_mask=valid_mask,
         meta=extent_meta,
+        valid_source=valid_source,
+        valid_context=valid_context,
     )
 
 
@@ -201,6 +279,8 @@ def save_raster(
     ensure_dir(out_path.parent)
 
     profile = dict(meta.profile)
+    profile.pop("blockxsize", None)
+    profile.pop("blockysize", None)
     profile.update(
         {
             "driver": "GTiff",
@@ -216,6 +296,17 @@ def save_raster(
             "nodata": nodata,
         }
     )
+
+    if bool(profile.get("tiled", False)):
+        if meta.width < 16 or meta.height < 16:
+            profile["tiled"] = False
+        else:
+            blockxsize = min(int(meta.width), 512)
+            blockysize = min(int(meta.height), 512)
+            blockxsize = max(16, (blockxsize // 16) * 16)
+            blockysize = max(16, (blockysize // 16) * 16)
+            profile["blockxsize"] = blockxsize
+            profile["blockysize"] = blockysize
 
     with rasterio.open(out_path, "w", **profile) as ds:
         ds.write(array.astype(dtype, copy=False), 1)

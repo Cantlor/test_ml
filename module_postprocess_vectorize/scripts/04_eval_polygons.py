@@ -8,11 +8,13 @@ from pathlib import Path
 from rich.console import Console
 from rich.logging import RichHandler
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+MODULE_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = MODULE_ROOT.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from postprocess.io import write_json
-from postprocess.metrics import evaluate_polygons, load_polygons
+from module_postprocess_vectorize.postprocess.io import write_json
+from module_postprocess_vectorize.postprocess.metrics import evaluate_polygons, load_polygons
 
 
 def setup_logger(level: str) -> logging.Logger:

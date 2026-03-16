@@ -2,91 +2,16 @@ from __future__ import annotations
 
 import itertools
 import logging
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import geopandas as gpd
 from tqdm import tqdm
 
-from .io import deep_update, read_json, to_serializable, write_json, write_yaml
+from .io import deep_update, to_serializable, write_json, write_yaml
+from .inputs import PredictionSample, discover_prediction_samples
 from .metrics import aggregate_metrics, evaluate_polygons, load_polygons, ranking_key
 from .pipeline import run_postprocess_pipeline
-
-
-@dataclass(frozen=True)
-class PredictionSample:
-    sample_id: str
-    extent_prob_path: Path
-    boundary_prob_path: Path
-    valid_mask_path: Optional[Path]
-    footprint_path: Optional[Path]
-
-
-def _resolve_footprint_from_manifest(pred_dir: Path, manifest_name: str = "predict_manifest.json") -> Optional[Path]:
-    manifest_path = pred_dir / manifest_name
-    if not manifest_path.exists():
-        return None
-    try:
-        obj = read_json(manifest_path)
-    except Exception:
-        return None
-
-    for key in ("aoi_raster", "source_raster", "input_raster"):
-        p = obj.get(key)
-        if isinstance(p, str):
-            cand = Path(p).resolve()
-            if cand.exists():
-                return cand
-    return None
-
-
-def discover_prediction_samples(
-    pred_root: Path,
-    extent_name: str = "extent_prob.tif",
-    boundary_name: str = "boundary_prob.tif",
-    valid_name: str = "valid_mask.tif",
-    manifest_name: str = "predict_manifest.json",
-) -> List[PredictionSample]:
-    root = pred_root.resolve()
-    if not root.exists():
-        raise FileNotFoundError(f"Prediction root does not exist: {root}")
-
-    extent_paths: List[Path] = []
-    direct_extent = root / extent_name
-    if direct_extent.exists():
-        extent_paths = [direct_extent]
-    else:
-        extent_paths = sorted(root.rglob(extent_name))
-
-    samples: List[PredictionSample] = []
-    for extent_path in extent_paths:
-        pred_dir = extent_path.parent
-        boundary_path = pred_dir / boundary_name
-        if not boundary_path.exists():
-            continue
-
-        valid_path = pred_dir / valid_name
-        valid_mask = valid_path if valid_path.exists() else None
-        footprint_path = None if valid_mask is not None else _resolve_footprint_from_manifest(pred_dir, manifest_name=manifest_name)
-
-        if pred_dir == root:
-            sample_id = pred_dir.name
-        else:
-            sample_id = str(pred_dir.relative_to(root))
-
-        samples.append(
-            PredictionSample(
-                sample_id=sample_id,
-                extent_prob_path=extent_path.resolve(),
-                boundary_prob_path=boundary_path.resolve(),
-                valid_mask_path=(valid_mask.resolve() if valid_mask is not None else None),
-                footprint_path=footprint_path,
-            )
-        )
-
-    samples = sorted(samples, key=lambda s: s.sample_id)
-    return samples
 
 
 def _candidate_gt_paths(gt_root: Path, sample_id: str, mode: str) -> List[Path]:
@@ -153,7 +78,7 @@ def resolve_gt_path(sample_id: str, gt_root: Path, gt_mode: str = "auto") -> Pat
     raise FileNotFoundError(f"GT file not found for sample_id='{sample_id}' under {root}")
 
 
-def build_grid(base_config: Mapping[str, Any]) -> List[Dict[str, Any]]:
+def _grid_values(base_config: Mapping[str, Any]) -> Dict[str, List[Any]]:
     search_cfg = (base_config.get("search", {}) or {})
     grid_cfg = (search_cfg.get("grid", {}) or {})
 
@@ -171,20 +96,143 @@ def build_grid(base_config: Mapping[str, Any]) -> List[Dict[str, Any]]:
     if not grid_cfg:
         grid_cfg = default_grid
 
-    keys = list(grid_cfg.keys())
-    values = []
-    for k in keys:
-        raw = grid_cfg[k]
+    out: Dict[str, List[Any]] = {}
+    for key, raw in grid_cfg.items():
         if isinstance(raw, list):
-            values.append(raw)
+            out[str(key)] = list(raw)
         else:
-            values.append([raw])
+            out[str(key)] = [raw]
+    return out
+
+
+def build_grid(base_config: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    values_map = _grid_values(base_config)
+    keys = list(values_map.keys())
+    values = [values_map[k] for k in keys]
 
     combinations = []
     for product in itertools.product(*values):
         params = {k: v for k, v in zip(keys, product)}
         combinations.append(params)
     return combinations
+
+
+def _params_key(params: Mapping[str, Any]) -> Tuple[Tuple[str, Any], ...]:
+    return tuple(sorted((str(k), params[k]) for k in params.keys()))
+
+
+def _sample_evenly(items: Sequence[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    n = len(items)
+    if n <= int(limit):
+        return [dict(item) for item in items]
+    if limit <= 1:
+        return [dict(items[0])]
+
+    out: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+    step = float(n - 1) / float(limit - 1)
+    for i in range(int(limit)):
+        idx = int(round(i * step))
+        idx = max(0, min(n - 1, idx))
+        if idx in seen:
+            continue
+        seen.add(idx)
+        out.append(dict(items[idx]))
+
+    if len(out) < int(limit):
+        for idx in range(n):
+            if idx in seen:
+                continue
+            out.append(dict(items[idx]))
+            seen.add(idx)
+            if len(out) >= int(limit):
+                break
+    return out
+
+
+def _build_refine_candidates(
+    *,
+    top_params: Sequence[Mapping[str, Any]],
+    values_map: Mapping[str, List[Any]],
+    refine_neighbor_span: int,
+    known: set[Tuple[Tuple[str, Any], ...]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set(known)
+    span = max(0, int(refine_neighbor_span))
+
+    for params in top_params:
+        for key, values in values_map.items():
+            if not values:
+                continue
+            try:
+                center_idx = values.index(params.get(key))
+            except ValueError:
+                continue
+            lo = max(0, center_idx - span)
+            hi = min(len(values) - 1, center_idx + span)
+            for idx in range(lo, hi + 1):
+                cand = dict(params)
+                cand[key] = values[idx]
+                cand_key = _params_key(cand)
+                if cand_key in seen:
+                    continue
+                seen.add(cand_key)
+                out.append(cand)
+    return out
+
+
+def _evaluate_trials(
+    *,
+    trials: Sequence[Mapping[str, Any]],
+    trial_offset: int,
+    samples: Sequence[PredictionSample],
+    gt_map: Mapping[str, gpd.GeoDataFrame],
+    output_dir: Path,
+    base_config: Mapping[str, Any],
+    iou_thr: float,
+    logger: logging.Logger,
+    desc: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for local_idx, params in enumerate(tqdm(trials, desc=desc, unit="trial"), start=1):
+        trial_idx = int(trial_offset + local_idx)
+        trial_cfg = deep_update(dict(base_config), dict(params))
+        trial_cfg["save_intermediates"] = False
+        trial_cfg["export_shp"] = False
+
+        sample_metrics = []
+        for s in samples:
+            res = run_postprocess_pipeline(
+                extent_prob_path=s.extent_prob_path,
+                boundary_prob_path=s.boundary_prob_path,
+                valid_mask_path=s.valid_mask_path,
+                footprint_path=s.footprint_path,
+                footprint_nodata_value=s.valid_nodata_value,
+                footprint_nodata_rule=s.valid_nodata_rule,
+                footprint_control_band_1based=s.valid_control_band_1based,
+                input_context=s.to_input_context(),
+                output_dir=output_dir / "_tmp" / f"trial_{trial_idx:04d}" / s.sample_id,
+                config=trial_cfg,
+                save_outputs=False,
+                logger=logger,
+            )
+            pred_gdf = res["fields_pred"]
+            gt_gdf = gt_map[s.sample_id]
+            m = evaluate_polygons(gt_gdf=gt_gdf, pred_gdf=pred_gdf, iou_threshold=iou_thr)
+            m["sample_id"] = s.sample_id
+            sample_metrics.append(m)
+
+        aggregated = aggregate_metrics(sample_metrics)
+        rows.append(
+            {
+                "trial": trial_idx,
+                "params": dict(params),
+                "metrics": aggregated,
+                "sample_metrics": sample_metrics,
+            }
+        )
+    return rows
 
 
 def run_grid_search(
@@ -216,50 +264,104 @@ def run_grid_search(
         gt_map[s.sample_id] = load_polygons(gt_path)
         gt_path_map[s.sample_id] = str(gt_path)
 
-    grid = build_grid(base_config)
-    if max_trials is not None:
-        grid = grid[: max(1, int(max_trials))]
-
-    if not grid:
+    full_grid = build_grid(base_config)
+    if not full_grid:
         raise RuntimeError("Search grid is empty")
+
+    search_cfg = dict(base_config.get("search", {}) or {})
+    strategy_cfg = dict(search_cfg.get("strategy", {}) or {})
+    strategy_mode = str(strategy_cfg.get("mode", "coarse_to_fine")).strip().lower()
+    max_trials_auto = int(strategy_cfg.get("max_trials_auto", 256))
+    coarse_trials = int(strategy_cfg.get("coarse_trials", max_trials_auto))
+    coarse_top_k = int(strategy_cfg.get("coarse_top_k", 3))
+    refine_neighbor_span = int(strategy_cfg.get("refine_neighbor_span", 1))
+
+    max_trials_total = None if max_trials is None else max(1, int(max_trials))
 
     iou_thr = float((base_config.get("scoring", {}) or {}).get("iou_threshold", 0.5))
 
     rows: List[Dict[str, Any]] = []
-    for trial_idx, params in enumerate(tqdm(grid, desc="postprocess-grid", unit="trial"), start=1):
-        trial_cfg = deep_update(dict(base_config), params)
-        trial_cfg["save_intermediates"] = False
-        trial_cfg["export_shp"] = False
+    coarse_count = 0
+    refine_count = 0
+    grid_truncated = False
 
-        sample_metrics = []
-        for s in samples:
-            res = run_postprocess_pipeline(
-                extent_prob_path=s.extent_prob_path,
-                boundary_prob_path=s.boundary_prob_path,
-                valid_mask_path=s.valid_mask_path,
-                footprint_path=s.footprint_path,
-                output_dir=output_dir / "_tmp" / f"trial_{trial_idx:04d}" / s.sample_id,
-                config=trial_cfg,
-                save_outputs=False,
-                logger=log,
-            )
-            pred_gdf = res["fields_pred"]
-            gt_gdf = gt_map[s.sample_id]
-            m = evaluate_polygons(gt_gdf=gt_gdf, pred_gdf=pred_gdf, iou_threshold=iou_thr)
-            m["sample_id"] = s.sample_id
-            sample_metrics.append(m)
+    if strategy_mode == "coarse_to_fine" and len(full_grid) > 1:
+        coarse_limit = max(1, min(len(full_grid), coarse_trials))
+        if max_trials_total is not None:
+            coarse_limit = min(coarse_limit, max_trials_total)
 
-        aggregated = aggregate_metrics(sample_metrics)
-        rows.append(
-            {
-                "trial": trial_idx,
-                "params": params,
-                "metrics": aggregated,
-                "sample_metrics": sample_metrics,
-            }
+        coarse_grid = _sample_evenly(full_grid, coarse_limit)
+        rows_coarse = _evaluate_trials(
+            trials=coarse_grid,
+            trial_offset=0,
+            samples=samples,
+            gt_map=gt_map,
+            output_dir=output_dir,
+            base_config=base_config,
+            iou_thr=iou_thr,
+            logger=log,
+            desc="postprocess-coarse",
         )
+        rows.extend(rows_coarse)
+        coarse_count = len(rows_coarse)
+
+        remaining = None if max_trials_total is None else max(0, max_trials_total - len(rows))
+        if remaining is None or remaining > 0:
+            rows_coarse_sorted = sorted(rows_coarse, key=lambda r: ranking_key(r["metrics"]), reverse=True)
+            top_rows = rows_coarse_sorted[: max(1, coarse_top_k)]
+            values_map = _grid_values(base_config)
+            known = {_params_key(item) for item in coarse_grid}
+            refine_candidates = _build_refine_candidates(
+                top_params=[r["params"] for r in top_rows],
+                values_map=values_map,
+                refine_neighbor_span=refine_neighbor_span,
+                known=known,
+            )
+            if remaining is not None and len(refine_candidates) > remaining:
+                refine_candidates = _sample_evenly(refine_candidates, remaining)
+                grid_truncated = True
+
+            if refine_candidates:
+                rows_refine = _evaluate_trials(
+                    trials=refine_candidates,
+                    trial_offset=len(rows),
+                    samples=samples,
+                    gt_map=gt_map,
+                    output_dir=output_dir,
+                    base_config=base_config,
+                    iou_thr=iou_thr,
+                    logger=log,
+                    desc="postprocess-refine",
+                )
+                rows.extend(rows_refine)
+                refine_count = len(rows_refine)
+    else:
+        eval_grid: List[Dict[str, Any]]
+        if max_trials_total is not None:
+            eval_grid = [dict(item) for item in full_grid[:max_trials_total]]
+            grid_truncated = len(eval_grid) < len(full_grid)
+        elif len(full_grid) > int(max_trials_auto):
+            eval_grid = _sample_evenly(full_grid, int(max_trials_auto))
+            grid_truncated = True
+        else:
+            eval_grid = [dict(item) for item in full_grid]
+
+        rows = _evaluate_trials(
+            trials=eval_grid,
+            trial_offset=0,
+            samples=samples,
+            gt_map=gt_map,
+            output_dir=output_dir,
+            base_config=base_config,
+            iou_thr=iou_thr,
+            logger=log,
+            desc="postprocess-grid",
+        )
+        coarse_count = len(rows)
 
     rows_sorted = sorted(rows, key=lambda r: ranking_key(r["metrics"]), reverse=True)
+    if not rows_sorted:
+        raise RuntimeError("Search produced no evaluated trials")
     best = rows_sorted[0]
 
     out_dir = output_dir.resolve()
@@ -275,7 +377,14 @@ def run_grid_search(
         "num_samples": len(samples),
         "samples": [s.sample_id for s in samples],
         "gt_paths": gt_path_map,
+        "search_strategy": strategy_mode,
+        "full_grid_trials": len(full_grid),
         "num_trials": len(rows),
+        "coarse_trials": int(coarse_count),
+        "refine_trials": int(refine_count),
+        "grid_truncated": bool(grid_truncated),
+        "max_trials_requested": max_trials_total,
+        "max_trials_auto": int(max_trials_auto),
         "best_trial": best["trial"],
         "best_params_override": best["params"],
         "best_metrics": best["metrics"],

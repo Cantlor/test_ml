@@ -65,7 +65,7 @@ Examples:
   $(basename "$0") --gt_root /path/to/gt_vectors_or_gt_rasters --gt_mode vector
 
   # Explicit run directory + tuned params
-  $(basename "$0") --run_dir output_data/module_net_train/runs/20260312_131232 --params_override /path/to/best_params.yaml
+  $(basename "$0") --run_dir output_data/module_net_train/runs/20260313_112627 --params_override /path/to/best_params.yaml
 EOF
 }
 
