@@ -15,6 +15,8 @@
 - `scripts/02_train.py`
 - `scripts/03_predict_aoi.py`
 - `scripts/04_eval.py`
+- `scripts/05_predict_raster.py` (single direct-raster predict)
+- `scripts/06_predict_input_data_batch.py` (batch direct-raster predict from `input_data/`)
 
 ## 2. Входной data contract
 
@@ -123,11 +125,56 @@ Near-invalid диагностика (test):
   --hardware module_net_train/configs/hardware_config.yaml \
   --run_dir output_data/module_net_train/runs/20260316_103300
 
+# Ручной infer по одному заданному raster (без AOI manifest/dataset_key workaround)
+./.venv/bin/python module_net_train/scripts/05_predict_raster.py \
+  --raster /abs/path/to/target.tif \
+  --run_dir output_data/module_net_train/runs/20260316_103300 \
+  --output_dir /abs/path/to/pred_out
+
+# Batch infer: автоматически взять *.tif/*.tiff из input_data/
+./.venv/bin/python module_net_train/scripts/06_predict_input_data_batch.py \
+  --input_dir input_data \
+  --run_dir output_data/module_net_train/runs/20260316_103300 \
+  --output_root output_data/module_net_train/direct_predict
+
+# Удобный shell-wrapper с дефолтными путями проекта
+bash scripts/run_predict_input_data.sh \
+  --run_dir output_data/module_net_train/runs/20260316_103300
+
 # Eval на test
 ./.venv/bin/python module_net_train/scripts/04_eval.py \
   --config module_net_train/configs/train_config.yaml \
   --hardware module_net_train/configs/hardware_config.yaml \
   --run_dir output_data/module_net_train/runs/20260316_103300
+```
+
+`05_predict_raster.py` пишет в `--output_dir`:
+- `extent_prob.tif`
+- `boundary_prob.tif`
+- `predict_manifest.json`
+
+`06_predict_input_data_batch.py` пишет в `--output_root`:
+- `<sample_id>/extent_prob.tif`
+- `<sample_id>/boundary_prob.tif`
+- `<sample_id>/predict_manifest.json`
+- `batch_predict_manifest.json`
+
+Где `<sample_id>` стабильно выводится из имени входного файла (`.tif/.tiff`) с безопасной нормализацией (lowercase + `_`), а при коллизиях добавляется суффикс `_2`, `_3`, ...
+
+Опционально можно включить постобработку:
+
+```bash
+./.venv/bin/python module_net_train/scripts/05_predict_raster.py \
+  --raster /abs/path/to/target.tif \
+  --run_dir output_data/module_net_train/runs/20260316_103300 \
+  --output_dir /abs/path/to/pred_out \
+  --with-postprocess \
+  --postprocess-config module_postprocess_vectorize/configs/postprocess_config.yaml
+
+# или для batch-flow из input_data/
+bash scripts/run_predict_input_data.sh \
+  --run_dir output_data/module_net_train/runs/20260316_103300 \
+  --with-postprocess
 ```
 
 ## 8. Progress UX в терминале
